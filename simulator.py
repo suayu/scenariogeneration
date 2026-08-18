@@ -31,6 +31,7 @@ from utils.metrics_helpers import compute_sim_agent_jsd_metrics
 from utils.torch_helpers import from_numpy
 from utils.data_container import CtRLSimData
 from utils.data_helpers import add_batch_dim, modify_agent_states
+from utils.data_analyse import analyse_json, analyse_file
 from utils.viz import render_state
 from models.ctrl_sim import CtRLSim
 
@@ -73,14 +74,25 @@ class Simulator:
         self.action_map = get_action_value_tensor()
         # tracks state of all objects during simulation
         self.data_dict = {}
+        self.step_data = []
+
+        # === 对抗轨迹控制属性 ===
+        self.adversarial_agent_id = None
+        self.adversarial_traj = None
+        self.adversarial_step_idx = 0
+        self.nearby_distance = 35 # 距离阈值：用于判断哪些路段/对象适合进行对抗性攻击
+
+        self.activate_agent_ids = []  # 用于存储当前场景中活跃的交通参与者索引
 
 
     def load_initial_scene(self, i):
         """ Load initial configurations of scenario (map and initial state) given index."""
         # scenario in scenario dreamer format
+        # 从二进制文件 (.pkl) 加载场景数据
         with open(os.path.join(self.dataset_path, self.test_files[i]), 'rb') as f:
             scenario_dict = pickle.load(f)
 
+        # 如果使用 RL 策略，加载额外的地图信息
         if self.cfg.sim.policy == 'rl':
             # load additional map info from gpudrive json
             if self.cfg.sim.mode == 'scenario_dreamer':
@@ -93,11 +105,13 @@ class Simulator:
             
             # convert map to GPUDrive format for compatibility 
             # with RL planners trained in GPUDrive
+            # 将地图转换为 GPUDrive 格式
             gpudrive_dict = from_json_Map(
                 gpudrive_dict, 
                 polylineReductionThreshold=self.cfg.sim.polyline_reduction_threshold
             )
 
+            # MAP
             scenario_dict['lanes_compressed'] = gpudrive_dict['lanes_compressed']
             scenario_dict['world_mean'] = gpudrive_dict['world_mean']
         return scenario_dict
@@ -171,9 +185,10 @@ class Simulator:
         return new_agent_idxs_to_remove
     
 
-    def step(self, action):
+    def step(self, action, anchors, refined_traj):
         """ Step function for scenario dreamer environment."""
         self.t += 1
+        self.activate_agent_ids = []  # Reset the list of active agent IDs for this step
         
         old_ego_state = copy.deepcopy(self.ego_state)
         # if action not supplied, default to log-replay
@@ -205,6 +220,7 @@ class Simulator:
                      self.ego_state[6], 
                      self.ego_state[7]]
                 )
+                # 更新自车状态
                 self.ego_state = agent_next_state
         else:
             self.ego_state = self.ego_trajectory[self.t]
@@ -227,7 +243,20 @@ class Simulator:
         else:
             self.data_dict = self.behaviour_model.step(self.data_dict)
 
+        # 保存攻击者状态
+        if self.adversarial_agent_id is not None and self.adversarial_traj is not None:
+            print("adversarial_step_idx:", self.adversarial_step_idx," len(adversarial_traj):", len(self.adversarial_traj))
+            if self.adversarial_step_idx < len(self.adversarial_traj):
+                adversarial_state = self.adversarial_traj[self.adversarial_step_idx]
+                # print("adversarial_state 1:", adversarial_state)
+            else:
+                adversarial_state = self.data_dict['agent'][-1][self.adversarial_agent_id]
+                # print("adversarial_state 2:", adversarial_state)
+        else:
+            adversarial_state = None
+
         # apply forward model to get the next states (only for active agents)
+        # 更新其他交通参与者状态
         next_states = forward_k_disks(
             states=self.data_dict['agent'][-1], 
             actions=self.data_dict['agent_next_action'], 
@@ -235,6 +264,21 @@ class Simulator:
             delta_t=self.dt, 
             exists=self.agent_active
         )
+        # print("next_states:", next_states)
+
+        # === 对抗轨迹覆盖执行 ===
+        if self.adversarial_agent_id is not None and self.adversarial_traj is not None:
+            if self.adversarial_step_idx < len(self.adversarial_traj):
+                target_state = self.adversarial_traj[self.adversarial_step_idx]
+                # print("target_state:", target_state)
+                if self.adversarial_agent_id < len(next_states):
+                    # 覆盖运动学状态 (x, y, vx, vy, heading)
+                    next_states[self.adversarial_agent_id, 0:5] = target_state[0:5]
+
+        # 恢复攻击者状态
+        if adversarial_state is not None:
+            next_states[self.adversarial_agent_id, 0:5] = adversarial_state[0:5]
+            self.adversarial_step_idx += 1
         
         # update last active positions for active agents
         # TODO: is this really necessary? If an agent leaves, we never use its position again, right?
@@ -245,6 +289,8 @@ class Simulator:
         agent_mask = self.ctrl_sim_dset.get_agent_mask(
             copy.deepcopy(next_states[:, None, :self.ctrl_sim_dset.HEAD_IDX+1]), 
             self.local_frame)[:, 0]
+        # print("agent_mask:", agent_mask)
+        # assert False, "agent_mask check"
         
         # newly added agents:
         # not active previously (self.agent_active set to 0) 
@@ -291,6 +337,10 @@ class Simulator:
         # update the data dictionary ego information
         self.data_dict['ego'].append(self.ego_state[None, :])
         
+        # 保存当前时间步数据
+        self.save_step_data()
+
+        # 检测终止条件
         terminated = False
         completed_route = ego_completed_route(
             self.local_frame['center'], 
@@ -306,6 +356,7 @@ class Simulator:
             self.scenario_dict['route'],
         )
         
+        # 处理仿真终止情况：碰撞、偏离路线、完成路线或达到最大步数
         if (collided or off_route or completed_route 
             or self.t == self.cfg.sim.steps):
             # handle case where off route simply 
@@ -319,6 +370,7 @@ class Simulator:
                 self.scenario_dict['route']
             )
             terminated = True
+            print(f"[Waarning] Terminated: {terminated}, Collided: {collided}, Off Route: {off_route}, Completed Route: {completed_route}, Progress: {progress:.2f}")
             info = {
                 'collision': collided,
                 'off_route': off_route,
@@ -342,7 +394,9 @@ class Simulator:
             self.data_dict['agent_active'] = copy.deepcopy(self.agent_active)
 
         self.current_state = self._get_observation()
-        self._update_viz_state()
+        print(" Ego State:", self.ego_state)
+        # print("anchors:", anchors)
+        self._update_viz_state(anchors, refined_traj)
         
         return self.current_state, terminated, info
     
@@ -396,9 +450,10 @@ class Simulator:
         return obs
 
 
-    def _update_viz_state(self, num_route_points=30):
+    def _update_viz_state(self, anchors=None, refined_traj=None, num_route_points=30):
         """ Update visualization state for current time step."""
         current_agent_states = self.data_dict['agent'][-1]
+        # print("current_agent_states:", current_agent_states)
         current_agent_types = self.data_dict['agent_type'][0]
         agent_active_mask = self.agent_active
         current_agent_states_rel = normalize_agents(
@@ -420,15 +475,28 @@ class Simulator:
         route_start = np.argmin(dist_to_route)
         route = route[route_start:route_start+num_route_points]
 
+        # 对 anchors 和 diffusion_trajectory 进行坐标转换
+        if anchors is not None:
+            anchors = np.array(anchors)  # 確保 anchors 是 NumPy 數組
+            anchors = normalize_route(anchors, normalize_dict=self.local_frame)
+        if refined_traj is not None:
+            refined_traj = np.array(refined_traj)  # 確保 refined_traj 是 NumPy 數組
+            refined_traj = refined_traj[:, :2]  # 提取 [x, y] 坐标
+            refined_traj = normalize_route(refined_traj, normalize_dict=self.local_frame)
+
+        # 整理数据，供render_state函数读取，并传递给viz模块。
         self.viz_state = {
             'route': route,
             'agent_states': current_agent_states_rel,
             'agent_types': current_agent_types,
             'agent_active': agent_active_mask,
+            'raw_agent_states': current_agent_states,
             'lanes': lanes,
-            'lanes_mask': lanes_mask
+            'lanes_mask': lanes_mask,
+            'anchors': anchors,
+            'diffusion_trajectory': refined_traj
         }
-
+        # assert False
 
     def initialize_data_dict(self):
         """ Initialize data dictionary for simulation."""
@@ -476,6 +544,10 @@ class Simulator:
     def reset(self, i):
         """ Reset the environment for a new scenario given index."""
         self.t = 0
+        # === 重置对抗轨迹状态 ===
+        self.adversarial_agent_id = None
+        self.adversarial_traj = None
+        self.adversarial_step_idx = 0
         self.scenario_dict = self.load_initial_scene(i)
 
         self.ego_trajectory = self.scenario_dict['agents'][-1]
@@ -490,7 +562,7 @@ class Simulator:
             self.ego_state[6]
         )
 
-        # non-ego agents
+        # 初始化其他交通参与者
         if self.cfg.sim.simulate_vehicles_only:
             vehicle_mask = self.scenario_dict['agent_types'][:-1, 1] == 1
         else:
@@ -500,11 +572,11 @@ class Simulator:
         if self.mode == 'waymo_log_replay':
             self.scenario_dict['actions'] = self.scenario_dict['actions'][:-1][vehicle_mask]
 
-        # initialize CtRL-Sim behaviour model
+        # 初始化行为模型
         self.behaviour_model.reset(
             len(self.scenario_dict['agents']) + 1) # +1 to account for the ego
 
-        # ego-centric simulation
+        # 初始化数据字典
         self.local_frame = {
             'center': self.ego_trajectory[0, :2].copy(),
             'yaw': self.ego_trajectory[0, 4].copy()
@@ -527,6 +599,9 @@ class Simulator:
         # Initialize data dictionary to track simulation state
         self.initialize_data_dict()
 
+        # 保存初始数据
+        self.save_initial_data(i)
+
         self.current_state = self._get_observation()
         self._update_viz_state()
 
@@ -537,6 +612,15 @@ class Simulator:
         """ Render the current state of the simulation."""
         agent_states = (
             self.viz_state['agent_states']
+            [self.viz_state['agent_active']])
+        # print("self.viz_state['agent_active']:", self.viz_state['agent_active'])
+
+        # 提取 agent_active 所有 True 值的下标，从 0 开始计数
+        agent_active_indices = [i for i, active in enumerate(self.viz_state['agent_active']) if active]
+        # print("Active agent indices (1-based):", agent_active_indices)
+
+        raw_agent_states = (
+            self.viz_state['raw_agent_states']
             [self.viz_state['agent_active']])
         
         ego_state = normalize_agents(
@@ -560,19 +644,153 @@ class Simulator:
         route = self.viz_state['route']
         lanes = self.viz_state['lanes']
         lanes_mask = self.viz_state['lanes_mask']
+        anchors = self.viz_state['anchors']
+        diffusion_trajectory = self.viz_state['diffusion_trajectory']
         
         render_state(
             states, 
+            raw_agent_states,
             agent_types, 
-            route, 
-            lanes, 
+            route,  # 简单巡线生成的自车未来轨迹
+            lanes,  # 道路中心线列表
             lanes_mask, 
+            anchors,
+            diffusion_trajectory,
             self.t, 
             name, 
             movie_path, 
-            lightweight=self.cfg.sim.lightweight
+            lightweight=self.cfg.sim.lightweight,
+            # active_agent_ids=self.activate_agent_ids  # 传递活跃交通参与者的全局编号
+            active_agent_ids=agent_active_indices  # 传递活跃交通参与者的全局编号
         )
 
+    def save_initial_data(self, scenario_idx):
+        """
+        保存初始数据
+        {
+            "road_network": [...],  // 道路拓扑
+            "road_network_compressed": {...},  // 压缩道路拓扑
+            "ego_vehicle": {
+                "initial_state": [x, y, vx, vy, heading, length, width]
+            },
+            "agents": [
+                {
+                    "initial_state": [x, y, vx, vy, heading, length, width]
+                },
+                ...
+            ]
+        }
+        """
+        # scenario_dict KEYS: dict_keys(['route', 'agents', 'agent_types', 'num_agents',
+        #                                'route_lane_indices', 'lanes', 'lane_graph', 'num_lanes'])
+        # data_dict KEYS: dict_keys(['agent', 'agent_type', 'agent_action', 'agent_rtg', 'agent_next_action',
+        #                            'agent_next_rtg', 'ego', 'ego_type', 'ego_action', 'ego_rtg', 'ego_next_rtg', 'lanes', 'agent_active'])
+
+        initial_data = {
+            "road_network": self.scenario_dict['lanes'].tolist(),
+            #"road_network_compressed": self.scenario_dict.get('lanes_compressed', None).tolist(),
+            "ego_vehicle": {
+                "initial_state": self.ego_state.tolist()
+            },
+            # "agents": {
+            #     f"agent_{idx}": {
+            #         "agent_type": int(np.argmax(self.scenario_dict['agent_types'][idx])), # 獨熱編碼 [is_unset, is_vehicle, is_pedestrian, is_cyclist, is_other] 轉爲int
+            #         "initial_state": agent.tolist()
+            #     }
+            #     for idx, agent in enumerate(self.scenario_dict['agents'])
+            # }
+            "agents": {
+                f"agent_{idx}": {
+                    "agent_type": ["unset", "vehicle", "pedestrian", "cyclist", "other"][np.argmax(self.scenario_dict['agent_types'][idx])],
+                    "initial_state": agent.tolist()
+                }
+                for idx, agent in enumerate(self.scenario_dict['agents'])
+            }
+        }
+        self.step_data = {
+            "ego_vehicle": [],
+            **{f"agent_{idx}": [] for idx in range(len(self.data_dict['agent'][0]))}
+        }
+        output_dir = os.path.join(self.cfg.sim.scenario_data_output_path, "initial_data")
+        os.makedirs(output_dir, exist_ok=True)
+        file_path = os.path.join(output_dir, f"scenario_{scenario_idx:04d}_initial.json")
+        with open(file_path, 'w') as f:
+            json.dump(initial_data, f, indent=4)
+        print(f"Initial data saved to {file_path}")
+
+    def save_step_data(self):
+        """
+        保存当前时间步数据
+        "ego_vehicle": [
+            [x, y, vx, vy, heading, length, width],
+            [x, y, vx, vy, heading, length, width],
+            ...
+        ],
+        "agent_0": [
+            [x, y, vx, vy, heading, length, width],
+            [x, y, vx, vy, heading, length, width],
+            ...
+        ],
+        """
+        self.step_data["ego_vehicle"].append(self.ego_state.tolist())
+        for idx, agent in enumerate(self.data_dict['agent'][-1]): # type(agent) = numpy.ndarray
+            self.step_data[f"agent_{idx}"].append(agent.tolist())
+
+    def dump_step_data(self, cur_scenario_idx):
+        # 如果仿真结束，保存所有时间步数据到单个 JSON 文件
+        output_dir = os.path.join(self.cfg.sim.scenario_data_output_path, "step_data")
+        os.makedirs(output_dir, exist_ok=True)
+        file_path = os.path.join(output_dir, f"scenario_{cur_scenario_idx:04d}_all_steps.json")
+        with open(file_path, 'w') as f:
+            json.dump(self.step_data, f, indent=4)
+        print(f"All step data saved to {file_path}")
+
+    def get_state_for_planning(self):
+        """提取当前环境状态供大模型分析,生成env_state_json字典"""
+        agents_info = []
+        # active_agent_ids = []  # 用于存储活跃交通参与者的全局编号
+        ego_x, ego_y = self.ego_state[:2]
+
+        # 筛选距离自车附近的交通参与者
+        # 或许可以采用KD-Tree等空间索引方法加速查找
+        for idx, agent in enumerate(self.data_dict['agent'][-1]):
+            if self.agent_active[idx]:
+                agent_x, agent_y = agent[:2]
+                distance = np.sqrt((agent_x - ego_x)**2 + (agent_y - ego_y)**2)
+                if distance <= self.nearby_distance:
+                    agents_info.append({
+                        "id": idx,
+                        "state": [float(s) for s in agent[:5]],  # x, y, vx, vy, heading
+                        "type": ["unset", "vehicle", "pedestrian", "cyclist", "other"][np.argmax(self.scenario_dict['agent_types'][idx])]
+                    })
+                    # self.activate_agent_ids.append(idx)  # 记录活跃交通参与者的全局编号
+
+        # 筛选自车较近范围内的道路点
+        route_info = []
+        # route_info = [[float(p[0]), float(p[1])] for p in self.scenario_dict['route'][:5]]
+        # print("route:", self.scenario_dict['route'])
+        for point in self.scenario_dict['route']:
+            route_x, route_y = point[:2]
+            distance = np.sqrt((route_x - ego_x)**2 + (route_y - ego_y)**2)
+            if distance <= self.nearby_distance:
+                route_info.append([float(route_x), float(route_y)])
+
+        print("\n(GLOBAL) nearby_agents_info:", agents_info)
+        return {
+            "ego_state": [float(s) for s in self.ego_state[:5]],
+            "route": route_info,
+            "agents": agents_info
+        }
+
+    def inject_adversarial_trajectory(self, agent_idx, trajectory):
+        """注入扩散模型生成的对抗轨迹。目前只支持修改单个交通参与者的轨迹。"""
+        self.adversarial_agent_id = agent_idx
+        self.adversarial_traj = trajectory
+        self.adversarial_step_idx = 0
+        # 保存对抗轨迹
+        self.data_dict['adversarial_trajectory'] = trajectory
+
+        # TODO: 修改全部交通参与者的轨迹
 
 class CtRLSimBehaviourModel:
     NUM_AGENT_STATES = 8  # [pos_x, pos_y, vel_x, vel_y, heading, length, width, existence]
@@ -840,7 +1058,6 @@ class CtRLSimBehaviourModel:
         
         return metrics_dict, ["{}: {:.6f}".format(k,v) for (k,v) in metrics_dict.items()]
 
-    
     def reset(self, num_agents):
         """ Reset the behaviour model state for a new scenario."""
         self.t = 0
@@ -848,7 +1065,6 @@ class CtRLSimBehaviourModel:
         self.types = np.zeros((num_agents, self.NUM_AGENT_TYPES))
         self.actions = np.zeros((num_agents, self.steps))
         self.rtgs = np.ones((num_agents, self.steps, self.cfg_model.num_reward_components)) * MAX_RTG_VAL
-
 
     def update_state(self, data_dict):
         """ Update the internal state of the behaviour model with new data."""
@@ -873,7 +1089,6 @@ class CtRLSimBehaviourModel:
 
         # clear out cache for all non-existing agents
         self.states[1:][~data_dict['agent_active']] = 0
-    
     
     def get_motion_data(self, data_dict):
         """ Prepare inputs to CtRL-Sim model for forward pass."""
@@ -1031,7 +1246,8 @@ class CtRLSimBehaviourModel:
         """ Get tilted logits for reward-to-go prediction."""
         rtg_bin_values = np.zeros((self.cfg_dataset.rtg_discretization, 1))
         rtg_bin_values[:, 0] = tilt * np.linspace(0, 1, self.cfg_dataset.rtg_discretization)
-
+        # test print
+        # print("tilt:",tilt, "rtg_bin_values:",rtg_bin_values)
         return rtg_bin_values
     
     def process_predicted_rtg(

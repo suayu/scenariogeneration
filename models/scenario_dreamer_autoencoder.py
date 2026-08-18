@@ -247,6 +247,7 @@ class ScenarioDreamerAutoEncoder(pl.LightningModule):
                 save_dir = self.cfg.eval.viz_dir
                 
                 print(f"Visualizing batch {batch_idx}...")
+                print("Scenario_dreamer_autoencoder Visualize Batch...")
                 visualize_batch(
                     num_samples, 
                     agent_samples, 

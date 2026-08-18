@@ -206,6 +206,16 @@ def get_ego_state(ego_state):
             [3] rel_goal_x (set to 0, matching gpudrive implementation)
             [4] rel_goal_y (set to 0, matching gpudrive implementation)
             [5] is_collided (set to 0, matching gpudrive implementation)
+
+    将自车状态转换为与 GPUDrive RL 规划器兼容的格式。
+
+    Args:
+        ego_state: 包含自车状态的数组，结构为：
+                   [pos_x, pos_y, vel_x, vel_y, heading, length, width, existence]
+
+    Returns:
+        np.array: 形状为 (1, 6)，包含以下特征：
+                  [speed, vehicle_length, vehicle_width, rel_goal_x, rel_goal_y, is_collided]
     """
     # Convert ego_state to float32 (creates a copy if needed, doesn't modify original)
     ego_state_f32 = np.asarray(ego_state, dtype=np.float32)
@@ -220,6 +230,7 @@ def get_ego_state(ego_state):
     
     # speed - computed from vel_x (ego_state[2]) and vel_y (ego_state[3])
     # All operations in float32
+    # 计算速度（vel_x 和 vel_y 的模长），并归一化
     vel_xy = ego_state_f32[2:4]
     speed = np.float32(np.linalg.norm(vel_xy))
     gpudrive_ego_state[0, 0] = speed / max_speed_f32
@@ -276,7 +287,23 @@ def get_partner_obs(
                  
                  Partners are processed in order (not sorted by distance), matching gpudrive behavior.
                  Matches gpudrive/gpudrive/env/env_torch.py _get_partner_obs output format.
+
+    将交通参与者状态转换为与 GPUDrive RL 规划器兼容的格式。
+
+    Args:
+        agents: 交通参与者状态数组，形状为 (num_agents, 8)，每行表示一个交通参与者：
+                [pos_x, pos_y, vel_x, vel_y, heading, length, width, existence]
+        ego_state: 自车状态，结构为 [pos_x, pos_y, vel_x, vel_y, heading, length, width, existence]
+        agent_active: 布尔数组，表示哪些交通参与者是活跃的。
+        num_partners: 返回的最大交通参与者数量（默认为 63）。
+        observation_radius: 观测半径，只有在此半径内的交通参与者才会被包含（默认为 32）。
+
+    Returns:
+        np.array: 形状为 (1, num_partners * 6)，包含每个交通参与者的 6 个特征：
+                  [speed, rel_pos_x, rel_pos_y, orientation, vehicle_length, vehicle_width]
     """
+
+    # 定义自车的局部坐标系
     local_frame = {
         'center': ego_state[:2],
         'yaw': ego_state[4]
@@ -284,6 +311,7 @@ def get_partner_obs(
     
     # Normalize agents to ego-centric coordinate frame
     # After normalization: [rel_x, rel_y, rel_vel_x, rel_vel_y, rel_heading, length, width, ...]
+    # 将交通参与者状态转换为自车坐标系下的相对状态
     normalized_agents = normalize_agents(
         agents[:, None, :], 
         normalize_dict=local_frame,
@@ -295,20 +323,24 @@ def get_partner_obs(
     
     # Process agents in order (matching gpudrive/src/sim.cpp collectPartnerObsSystem)
     # No sorting by distance - just iterate through in order
+    # 遍历所有交通参与者
     for agent_id in range(len(agents)):
         # Skip inactive agents
         if not agent_active[agent_id]:
             continue
         
         # Check if within observation radius (matching gpudrive line 222)
+        # 计算与自车的距离
         normalized_agent = normalized_agents[agent_id]
-        rel_pos = normalized_agent[:2]  # rel_x, rel_y
+        rel_pos = normalized_agent[:2]  # 提取相对位置 [rel_x, rel_y]
         dist = np.linalg.norm(rel_pos)
         
+        # 如果距离超过观测半径，则跳过
         if dist > observation_radius:
             continue
         
         # Stop if we've filled all partner slots
+        # 如果已填满最大数量，则停止
         if arr_index >= num_partners:
             break
         
@@ -329,6 +361,7 @@ def get_partner_obs(
         
         # Build partner observation matching gpudrive format:
         # [speed, rel_pos_x, rel_pos_y, orientation, vehicle_length, vehicle_width]
+        # 提取并归一化交通参与者的状态
         partner = np.array([
             np.linalg.norm(normalized_agent[2:4]) / MAX_SPEED,  # speed from vel_x, vel_y
             rel_x,  # normalized relative x position
@@ -388,6 +421,7 @@ def get_map_obs(
                  
                  Matches gpudrive/gpudrive/env/env_torch.py _get_road_map_obs output format.
     """
+    # 定义自车的局部坐标系
     local_frame = {
         'center': ego_state[:2],
         'yaw': ego_state[4]
@@ -395,17 +429,20 @@ def get_map_obs(
     # Filter out road edges (matching gpudrive/src/knn.hpp line 116)
     # Type is one-hot encoded at indices 6-12
     # RoadEdge (EntityType.RoadEdge = 1) is at index 7 in the one-hot encoding
-    road_edge_one_hot_idx = 6 + EntityType.RoadEdge.value  # 6 + 1 = 7
+    # 过滤掉 RoadEdge 类型的道路段
+    road_edge_one_hot_idx = 6 + EntityType.RoadEdge.value  # 6 + 1 = 7  RoadEdge 的 one-hot 编码索引
     # Keep only non-road-edge entities (where RoadEdge one-hot is 0)
     non_edge_mask = (lanes[:, road_edge_one_hot_idx] == 0.0)
     lanes_filtered = lanes[non_edge_mask]
     
     if len(lanes_filtered) == 0:
         # Return zero-padded observation
+        # 如果没有有效的道路段，返回零填充的张量
         map_tensor = np.zeros((max_num_lanes, num_lane_features))
         return map_tensor.flatten()[None, :]
     
     # Calculate distances to ego (in global coordinates before normalization)
+    # 计算每个道路段到自车的距离
     dist_to_ego = np.linalg.norm(
         lanes_filtered[:, :2] - ego_state[None, :2], axis=-1)
     
@@ -413,8 +450,10 @@ def get_map_obs(
     # The C++ code: 1) fills first K, 2) makes heap, 3) processes remaining with pop/push, 4) radiusFilter swaps
     # This creates a specific order that's not pure heap order due to radiusFilter swaps
     
+    # 使用堆排序选择最近的 K 个道路段
     if len(lanes_filtered) <= max_num_lanes:
         # If we have fewer than K roads, just take all of them (after radius filtering)
+        # 如果道路段数量少于 K，直接选择所有在观测半径内的道路段
         radius_mask = dist_to_ego <= observation_radius
         valid_indices = np.where(radius_mask)[0]
     else:
@@ -479,6 +518,7 @@ def get_map_obs(
     # This puts the ego at origin (0,0) facing forward (positive y-axis in ego frame)
     # Normalize lanes to ego-centric coordinate frame
     # After normalization: [rel_x, rel_y, segment_length, segment_width, segment_height, rel_heading, type, ...]
+    # 转换为自车坐标系
     lanes_normalized = normalize_lanes(
         lanes_selected[:, None], 
         normalize_dict=local_frame,
@@ -550,6 +590,9 @@ def get_route_obs(
         np.array: Flattened route observation, shape (1, 61) = (30 points * 2 coords + 1 numPoints)
                   Matches ROUTE_FEAT_DIM = 61
                   Format: [x0, y0, x1, y1, ..., x29, y29, numPoints]
+
+    将路径点 route_points 转换为与 GPUDrive RL 规划器兼容的格式。
+    提取距离自车最近的路径点，并将后续的路径点转换为自车坐标系下的特征表示。
     """
     if route_points is None or len(route_points) == 0:
         # Return zero-padded route observation
@@ -562,10 +605,12 @@ def get_route_obs(
     
     # Find closest route point to ego's current position
     # Synced with gpudrive/src/sim.cpp routeProcessingSystem
+    # 找到距离自车最近的路径点
     dists_sq = np.sum((route_points - ego_pos[None, :]) ** 2, axis=1)
     closest_idx = np.argmin(dists_sq)
     
     # Extract up to max_route_points starting from closest point
+    # 提取从最近点开始的路径段
     num_extracted = min(max_route_points, len(route_points) - closest_idx)
     
     if num_extracted == 0:
@@ -598,6 +643,7 @@ def get_route_obs(
     route_obs = np.zeros((1, max_route_points * 2 + 1))
     
     # Fill in the extracted points
+    # 创建路径观测张量
     route_obs[0, :num_extracted * 2] = ego_centric_points.flatten()
     
     # Normalize coordinates if requested
@@ -616,6 +662,7 @@ def get_route_obs(
         route_obs[0, :num_extracted * 2] = route_obs[0, :num_extracted * 2]
     
     # Set numPoints (last element)
+    # 设置路径点数量
     route_obs[0, -1] = float(num_extracted)
     
     return route_obs.astype(np.float32)

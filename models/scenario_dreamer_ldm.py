@@ -158,7 +158,7 @@ class ScenarioDreamerLDM(pl.LightningModule):
         
         if visualize:
             print(f"Visualizing batch {batch_idx}...")
-            
+            print("Scenario_dreamer_ldm Visualize Batch...")
             if num_samples_to_visualize is None:
                 num_samples_to_visualize = data.batch_size
             

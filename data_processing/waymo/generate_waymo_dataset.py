@@ -1,5 +1,6 @@
 import math
 import os
+import json
 os.environ["CUDA_VISIBLE_DEVICES"] = ""    # hide GPUs
 import copy
 import pickle
@@ -23,6 +24,7 @@ _WAYMO_OBJECT_STR = {
     'TYPE_CYCLIST': "cyclist",
     'TYPE_OTHER': "other",
 }
+MAP_FEATURE_PATH = ""
 
 def poly_gon_and_line(poly_dict):
 
@@ -306,6 +308,13 @@ def get_road_info(scenario_list, index):
         else:
             map_feature[key] = [mf]
     
+    output_dir = os.path.join(self.cfg.sim.scenario_data_output_path, "map_feature")
+    os.makedirs(output_dir, exist_ok=True)
+    file_path = os.path.join(output_dir, f"map_feature.json")
+    with open(MAP_FEATURE_PATH, 'w') as f:
+        json.dump(map_feature, f, indent=4)
+    print(f"Map feature data saved to {MAP_FEATURE_PATH}")
+
     road_info = dict()
     for key in map_feature.keys():
         if key == 'lane':

@@ -22,3 +22,5 @@ behaviour_model:
   use_rtg: True # whether behaviour model conditions on return-to-go
   predict_rtgs: True # whether behaviour model predicts return-to-go
   compute_metrics: False # compute metrics for behaviour model?
+save_carla_data: True # whether to save out .dat files for CARLA replay (for visualizing in CARLA)
+scenario_data_output_path: './carla_maps' # path to save CARLA .dat files

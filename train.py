@@ -72,6 +72,7 @@ def train_ldm(cfg, cfg_ae, save_dir=None):
     # check if latent stats are cached, if not, compute them
     if not os.path.exists(cfg.dataset.latent_stats_path):
         cache_latent_stats(cfg)
+        #　assert False
     cfg = set_latent_stats(cfg)
 
     datamodule = instantiate(cfg.datamodule, dataset_cfg=cfg.dataset)
@@ -204,7 +205,7 @@ def main(cfg):
         cfg_ae.dataset_name = dataset_name
         OmegaConf.set_struct(cfg, True)    # relock
         OmegaConf.set_struct(cfg_ae, True)
-    else:
+    else: # Ctrl-sim
         model_name = cfg.model_name
         cfg = cfg.ctrl_sim
         OmegaConf.set_struct(cfg, False)

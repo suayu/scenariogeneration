@@ -202,6 +202,7 @@ class IDMPolicy:
 
 
     def select_action(self, obs, is_planner=True):
+        # 步骤1：更新时间步和受控车辆ID（通常控制最后一辆车为ego）
         self.t += 1
 
         agent_states = obs # Use absolute agent states (world coord. system, to match with lanes)
@@ -209,9 +210,12 @@ class IDMPolicy:
         self.is_planner = is_planner
 
         # Update agent lane locations
+        # 步骤2：计算所有车辆当前所在车道
         self._compute_all_agent_lanes(agent_states)
         
+        # 步骤3：根据控制模式选择输出动作
         if not self.strict_lane_follow:
+            # 模式A：加速度+转向角控制（更灵活）
             # Steering: follow lane path to goal
             steerings = self._get_steerings(agent_states)
             
@@ -227,6 +231,7 @@ class IDMPolicy:
             else:
                 actions = np.array([accelerations[self.controlled_agent_ids[0]], steerings[self.controlled_agent_ids[0]]])
         else:
+            # 模式B：严格车道跟踪（输出下一时刻状态）
             # Strictly following lanes means we do not need to compute steering, only the next position along a lane path
             next_x, next_y, next_theta, next_vel = self._get_next_states(agent_states)
 
@@ -730,4 +735,3 @@ class IDMPolicy:
                 return self.lane_geometries[current_lane][lane_point], current_lane, lane_point, True  # Flag path termination
 
 
-    

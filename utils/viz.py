@@ -3,11 +3,14 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import matplotlib.transforms as transforms
 import os
+import json
 from utils.geometry import *
 import math
 from cfgs.config import LANE_CONNECTION_TYPES_WAYMO, LANE_CONNECTION_TYPES_NUPLAN
 from moviepy.editor import ImageSequenceClip
 import wandb
+
+has_printed_save_fig_path = False
 
 def plot_scene(
         agent_states, 
@@ -160,6 +163,18 @@ def plot_scene(
     # Create the save directory if it doesn't exist
     if not os.path.exists(save_dir):
         os.makedirs(save_dir, exist_ok=True)
+
+    # # Export data to JSON
+    # export_data = {
+    #     "agent_states": agent_states.tolist(),
+    #     "road_points": road_points.tolist(),
+    #     "agent_types": agent_types.tolist(),
+    #     "lane_types": lane_types.tolist() if lane_types is not None else None
+    # }
+    # json_path = os.path.join(save_dir, f"{name.split('.')[0]}.json")
+    # with open(json_path, 'w') as f:
+    #     json.dump(export_data, f, indent=4)
+    # print(f"Exported scene data to {json_path}")
 
     if return_fig:
         # Return the figure object for logging
@@ -361,19 +376,33 @@ def plot_k_disks_vocabulary(V, png_path, dpi=1000):
 
 def render_state(
         agent_states, 
+        raw_agent_states,
         agent_types, 
         route, 
         lanes, 
         lanes_mask, 
+        anchors,
+        diffusion_trajectory,
         t, 
         name, 
         movie_path='video_frames', 
-        lightweight=False
+        lightweight=False,
+        active_agent_ids=[]
     ):
     """ Renders the current state of the simulation and saves it as a PNG image."""
-    png_dir = f'{movie_path}/{name}'
-    if not os.path.exists(png_dir):
-        os.makedirs(png_dir, exist_ok=True)
+    global has_printed_save_fig_path
+
+    png_dir = f'{movie_path}'
+
+    # 清空图片文件夹
+    if t == 0:  # 仅在仿真开始时清空文件夹
+        if os.path.exists(png_dir):
+            for file in os.listdir(png_dir):
+                file_path = os.path.join(png_dir, file)
+                if os.path.isfile(file_path) and file.endswith(".png"):
+                    os.remove(file_path)
+        else:
+            os.makedirs(png_dir, exist_ok=True)
 
     agent_alpha = 1.0
     agent_zord = 4
@@ -388,6 +417,24 @@ def render_state(
     ax.set_ylim(y_min, y_max)
     ax.set_aspect('equal', adjustable='box')
     ax.axis('off')
+
+    # 添加以自车为中心的圆
+    ego_x, ego_y = agent_states[-1, 0], agent_states[-1, 1]  # 自车位置
+    circle_radius = 35  # 圆的半径
+    circle = mpatches.Circle(
+        (ego_x, ego_y),
+        circle_radius,
+        color='blue',
+        alpha=0.05,  # 极高的透明度
+        zorder=10  # 确保圆绘制在上层
+    )
+    ax.add_patch(circle)
+
+    # 添加 x 和 y 坐标轴
+    # ax.axhline(0, color='black', linewidth=0.5, linestyle='--', alpha=0.7)  # x轴
+    # ax.axvline(0, color='black', linewidth=0.5, linestyle='--', alpha=0.7)  # y轴
+    # ax.set_xlabel("X (meters)", fontsize=10)
+    # ax.set_ylabel("Y (meters)", fontsize=10)
 
     lanes = np.concatenate([lanes, lanes_mask[:, :, None]], axis=-1)
 
@@ -498,8 +545,48 @@ def render_state(
                 alpha=0.25, 
                 linewidth=0.3 / ((x_max - x_min) / 140))
     
-    # for debugging
-    # ax.annotate(a, (vehicle_center[0], vehicle_center[1]), zorder=8, fontsize=5) 
+        # Add agent ID as text
+
+        # DEBUG:绘制的交通参与者ID是当前画面内交通参与者的id，而非全局id。坐标是自车坐标系下的坐标，而非全局坐标系下的坐标。
+        if a != len(agent_states) - 1:  # Skip ego vehicle
+            # id = active_agent_ids[a] if a < len(active_agent_ids) else a
+            if a < len(active_agent_ids):
+                id = active_agent_ids[a]
+            else:
+                id = a * 100  # Fallback to index if active_agent_ids is not long enough
+            ax.text(
+                agent_states[a, 0],
+                agent_states[a, 1],
+                f"{id}\n({raw_agent_states[a, 0]:.1f}, {raw_agent_states[a, 1]:.1f})",
+                color='black',
+                fontsize=6,
+                ha='center',
+                va='center',
+                zorder=zord+2
+            )
+
+    # ego_x, ego_y = agent_states[-1, 0], agent_states[-1, 1]
+    # ax.text(
+    #     x_max - 10, y_max - 10,  # Position in the top-right corner
+    #     f"Ego: ({ego_x:.2f}, {ego_y:.2f})",
+    #     color='black',
+    #     fontsize=8,
+    #     ha='right',
+    #     va='top',
+    #     zorder=10
+    # )
+    # print("raw_agent_states:",raw_agent_states)
+    print("active_agent_ids:",active_agent_ids)
+
+    ax.text(
+        x_min + 10, y_max - 10,  # Position in the top-left corner
+        f"t: {t}",
+        color='black',
+        fontsize=8,
+        ha='left',
+        va='top',
+        zorder=10
+    )
     
     if route is not None:
         plt.scatter(
@@ -509,15 +596,44 @@ def render_state(
             zorder=ego_zord, 
             s=8
         )
+    # Plot anchors
+    if anchors is not None and len(anchors) > 0:
+        anchors = np.array(anchors)
+        ax.scatter(
+            anchors[:, 0],
+            anchors[:, 1],
+            color='blue',
+            label='Anchors',
+            zorder=6,
+            s=20
+        )
+
+    # Plot diffusion trajectory
+    if diffusion_trajectory is not None and len(diffusion_trajectory) > 0:
+        diffusion_trajectory = np.array(diffusion_trajectory)
+        ax.plot(
+            diffusion_trajectory[:, 0],
+            diffusion_trajectory[:, 1],
+            color='red',
+            label='Diffusion Trajectory',
+            zorder=7,
+            linewidth=1.5
+        )
+
     plt.tight_layout()
     dpi = 100 if lightweight else 500
+
+    # 只打印一次
+    # if not has_printed_save_fig_path:
+    #     print(f"save_fig:{png_dir}/frame_{t:03}.png")
+    #     has_printed_save_fig_path = True  # 设置为 True，确保只打印一次
     plt.savefig(f'{png_dir}/frame_{t:03}.png', dpi=dpi)
     plt.close(fig)
 
 
 def generate_video(name, output_dir, delete_images=False):
     """ Generates a video from a sequence of images saved in a directory."""
-    image_folder = f'{output_dir}/{name}'
+    image_folder = f'{output_dir}'
     
     # Get list of all image files in the directory
     images = [os.path.join(image_folder, img) for img in sorted(os.listdir(image_folder)) if img.endswith(".png")]
@@ -525,10 +641,11 @@ def generate_video(name, output_dir, delete_images=False):
     images.sort()  # Sort by filename
 
     # Create a video clip from the image sequence
-    clip = ImageSequenceClip(images, fps=20)
+    clip = ImageSequenceClip(images, fps=5)
+    # clip = ImageSequenceClip(images, fps=10)
     
     # Write the video file
-    clip.write_videofile(f"{image_folder}.mp4", codec='libx264')
+    clip.write_videofile(f"{image_folder}/{name}.mp4", codec='libx264')
 
     if delete_images:
         for image in images:

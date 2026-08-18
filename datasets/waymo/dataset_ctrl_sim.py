@@ -51,6 +51,7 @@ class CtRLSimDataset(Dataset):
 
         self.preprocessed_dir = os.path.join(self.cfg.preprocess_dir, f"{self.split_name}")
         if not os.path.exists(self.preprocessed_dir):
+            print("self.preprocessed_dir:",self.preprocessed_dir)
             os.makedirs(self.preprocessed_dir, exist_ok=True)
         
         if not self.preprocess:
@@ -290,7 +291,7 @@ class CtRLSimDataset(Dataset):
     def get_agent_mask(self, agent_states, normalize_dict, fov=None):
         """ Get mask of agents within field of view."""
         if fov is None:
-            fov = self.cfg.fov
+            fov = self.cfg.fov # default fov = 80
         
         agent_states = normalize_agents(agent_states, normalize_dict)
         agent_states = agent_states[:, :, [self.POS_X_IDX, self.POS_Y_IDX, self.HEAD_IDX]]

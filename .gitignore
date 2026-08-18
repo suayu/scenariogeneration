@@ -12,3 +12,29 @@ metadata/simulation_environment_datasets/scenario_dreamer_waymo_100m_jsons/
 metadata/simulation_environment_datasets/waymo_sim_test_pickles/
 metadata/simulation_environment_datasets/waymo_sim_test_jsons/
 run.sh
+
+# Local simulator installations and external working trees
+/Carla/
+/safe-sim/
+/carla_maps/
+
+# Generated simulation outputs
+/multirun/
+/outputs/
+/*.log
+/*.mp4
+/*.xodr
+*.ckpt
+*.hdf5
+*.pt
+*.pth
+
+# Machine-local environment snapshots and scratch files
+/env_scenario_dreamer_*.txt
+/set_path.sh
+/scratch
+/temp.txt
+/prompt.txt
+/attack_request.txt
+.env
+.env.*
