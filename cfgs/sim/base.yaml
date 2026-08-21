@@ -9,10 +9,13 @@ polyline_reduction_threshold: 0.1 # from gpudrive
 visualize: False # create videos of the simulation?
 lightweight: False # lightweight visualization (runs faster, less dpi and lower frame rate)
 movie_path: ${project_root}/movies # path to save visualization movies
+visualization:
+  show_llm_anchors: True # 是否绘制 LLM 生成的稀疏轨迹锚点
+  show_diffusion_trajectory: True # 是否绘制 Safe-Sim 生成的攻击者未来细化轨迹
 verbose: True # report metrics after each simulation?
 steps: 400 # number of steps in each simulation
 dt: 0.1 # time delta between simulation steps
-simulate_vehicles_only: False # whether to simulate only vehicles (default is to simulate all agents (vehicles + pedestrians + cyclists))
+simulate_vehicles_only: True # 当前 Safe-Sim 权重仅支持车辆，因此只将车辆纳入闭环仿真
 agent_scale: 1.0 # agent scale for collision checking (GPUDrive uses 0.7)
 behaviour_model:
   run_name: ctrl_sim_waymo_1M_steps # run name of the behaviour model to load
@@ -22,5 +25,75 @@ behaviour_model:
   use_rtg: True # whether behaviour model conditions on return-to-go
   predict_rtgs: True # whether behaviour model predicts return-to-go
   compute_metrics: False # compute metrics for behaviour model?
+traffic_model:
+  backend: safe_sim_diffusion # 可选后端：safe_sim_diffusion、ctrl_sim、log_replay
+  safe_sim_root: ${project_root}/safe-sim
+  config_path: ${sim.traffic_model.safe_sim_root}/safesim_checkpoints/safesim_fut32/test/run0/config.json
+  checkpoint_path: ${sim.traffic_model.safe_sim_root}/safesim_checkpoints/safesim_fut32/test/run0/checkpoints/iter70000.ckpt
+  device: cuda:0
+  history_frames: 11 # 权重所需历史帧数加当前帧
+  prediction_horizon: 32
+  max_neighbors: 20
+  num_samples: 20
+  sample_step: 1
+  guidance:
+    # 启动时只需覆盖 mode：unguided、default、llm_joint、manual。
+    mode: unguided
+    params:
+      inner_lr: 0.2 # 每个反向扩散步中的引导梯度步长
+      inner_beta: 0.5 # 单次引导对控制量的最大修正幅度
+      n_guide_steps: 1 # 每个反向扩散步执行的引导更新次数
+      scale_grad_by_std: True # 按当前扩散噪声方差缩放梯度
+      grad_wrt: clean_guide
+    default:
+      # 顺序固定为：几何防重叠、道路中心线、自车 TTC 风险。
+      weights: [2.0, 1.0, 2.0]
+      configs: {}
+    llm_joint:
+      # 顺序固定为：几何防重叠、道路中心线、自车 TTC 风险、LLM 锚点。
+      weights: [2.0, 1.0, 2.0, 3.0]
+      configs: {}
+    loss_configs:
+      scenario_collision:
+        safety_margin: 0.5
+        temperature: 0.5
+        loss_timesteps: 20
+        filter_timesteps: 20
+        loss_scale: 1.0
+      route:
+        lane_margin: 1.0
+        nonlinear_factor: 5.0
+        loss_timesteps: 32
+        filter_timesteps: 32
+        loss_scale: 1.0
+      scenario_ttc:
+        distance_bandwidth: 2.0
+        time_bandwidth: 2.0
+        min_velocity_diff: 0.1
+        max_ttc: 6.0
+        loss_timesteps: 20
+        filter_timesteps: 20
+        loss_scale: 1.0
+    manual:
+      # 手动模式完全按照下列列表、权重和逐项配置构造组合损失。
+      functions: [scenario_collision, route, scenario_ttc]
+      weights: [2.0, 1.0, 2.0]
+      configs: {}
+  anchor_guidance:
+    enabled: False # 旧版兼容开关；存在 guidance.mode 时以 mode 为准
+    strength: 0.8 # 锚点损失权重；已在联合引导闭环场景中验证
+    anchor_interval_seconds: 1.0 # LLM 相邻锚点的时间间隔
+    robust_delta: 1.0 # 径向 Huber 损失由二次区间切换到线性区间的距离阈值，单位为米
+    inner_lr: 0.2 # 每个反向扩散步中的引导梯度步长
+    max_update: 0.5 # 单次引导对控制量的最大修正幅度
+    guide_steps: 1 # 每个反向扩散步执行的引导更新次数
+    scale_grad_by_std: True # 按当前扩散噪声方差缩放梯度
+llm:
+  model_name: qwen3.5-27b # 可通过 sim.llm.model_name=<模型名> 覆盖，便于切换免费模型
+  multimodal: False # False 为纯文本模式；True 为当前帧图像加结构化场景数据
+  attack_mode: trajectory_only # trajectory_only、obstacle_only、joint；决定每次查询允许的攻击类型
+  max_consecutive_failures: 3 # 连续服务/API失败达到该次数后，本场景不再调用 LLM
+  obstacles:
+    enabled: False # 兼容旧配置；新逻辑以 llm.attack_mode 为准
 save_carla_data: True # whether to save out .dat files for CARLA replay (for visualizing in CARLA)
-scenario_data_output_path: './carla_maps' # path to save CARLA .dat files
+scenario_data_output_path: './carla_maps' # 保存 CARLA 回放数据的目录

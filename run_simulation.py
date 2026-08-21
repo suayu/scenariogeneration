@@ -24,7 +24,11 @@ class PolicyEvaluator:
         self.env = env
 
         # 实例化对抗场景生成器
-        self.generator = AdversarialScenarioGenerator(cfg, user_instruction)
+        self.generator = AdversarialScenarioGenerator(
+            cfg,
+            user_instruction,
+            llm_planner=env.llm_planner,
+        )
     
     def reset(self):
         """ Reset the evaluator's statistics and random seeds."""
@@ -79,12 +83,17 @@ class PolicyEvaluator:
                 self.policy.reset(obs)
 
             # 在单个场景中执行固定步数的交互
-            for t in range(self.env.steps):
+            for _ in range(self.env.steps):
+                current_t = self.env.current_step
                 # 1. 调用生成器：低频触发大模型规划与轨迹注入
-                flag = self.generator.step(self.env, t)
+                self.generator.step(self.env, current_t)
+
+                # 2. Safe-Sim 先基于当前快照预测所有受控非自车参与者；Simulator.step 仅执行第一帧。
+                self.env.prepare_background_traffic()
+                self.generator.set_diffusion_trajectory(
+                    self.env.get_attack_target_prediction()
+                )
                 anchors, refined_traj = self.generator.get_anchors_and_trajectory()
-                # 每个场景最多调用大模型固定次数，然后停止进一步攻击
-                assert flag, "LLM call limit reached, stopping simulation for this episode."
 
                 if self.cfg.visualize:
                     # render_frame = True
@@ -95,7 +104,7 @@ class PolicyEvaluator:
                     # if render_frame:
                     self.env.render_state(name=f'{i}', movie_path=self.cfg.movie_path)
                 
-                # 2. 自车决策与环境步进
+                # 3. 自车决策与环境步进
                 action = self.policy.act(obs)
                 obs, terminated, info = self.env.step(action, anchors, refined_traj)
 
@@ -106,7 +115,7 @@ class PolicyEvaluator:
                     self.env.dump_step_data(i)
                     break
 
-                print("step:",t," of ",self.env.steps)
+                print("step:", current_t, " of ", self.env.steps)
 
             # 场景结束，记录本回合最小TTC 似乎不需要单独记录
             # self.generator.finalize_episode_stats()
@@ -116,7 +125,7 @@ class PolicyEvaluator:
                 generate_video(name=f'{i}', output_dir=self.cfg.movie_path, delete_images=False)
             
             if self.cfg.verbose:
-                if self.cfg.behaviour_model.compute_metrics:
+                if self.cfg.behaviour_model.compute_metrics and self.env.behaviour_model is not None:
                     print("behaviour model metrics: ", self.env.behaviour_model.compute_metrics()[-1])
                 # policy metrics
                 print(self.compute_metrics()[-1])

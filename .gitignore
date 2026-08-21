@@ -11,12 +11,19 @@ metadata/simulation_environment_datasets/scenario_dreamer_waymo_55m_jsons/
 metadata/simulation_environment_datasets/scenario_dreamer_waymo_100m_jsons/
 metadata/simulation_environment_datasets/waymo_sim_test_pickles/
 metadata/simulation_environment_datasets/waymo_sim_test_jsons/
+/metadata/simulation_environment_datasets/
+/metadata/gpudrive_checkpoint/
+/metadata/nuplan_eval_set.pkl
+/metadata/waymo_eval_set.pkl
+/metadata/nocturne_train_filenames.pkl
 run.sh
 
 # Local simulator installations and external working trees
 /Carla/
 /safe-sim/
 /carla_maps/
+/gpudrive/
+/.gitmodules
 
 # Generated simulation outputs
 /multirun/
@@ -36,5 +43,11 @@ run.sh
 /temp.txt
 /prompt.txt
 /attack_request.txt
+
+# 本地评估、绘图和模型探测工具，不属于正式危险场景生成主流程
+/tests/plot_llm_joint_result.py
+/tests/probe_llm_model.py
+/tests/run_anchor_guidance_validation.py
+/tests/run_full_adversarial_evaluation.py
 .env
 .env.*

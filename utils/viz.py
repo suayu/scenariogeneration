@@ -387,7 +387,10 @@ def render_state(
         name, 
         movie_path='video_frames', 
         lightweight=False,
-        active_agent_ids=[]
+        active_agent_ids=[],
+        static_obstacles=None,
+        show_llm_anchors=True,
+        show_diffusion_trajectory=True,
     ):
     """ Renders the current state of the simulation and saves it as a PNG image."""
     global has_printed_save_fig_path
@@ -477,6 +480,33 @@ def render_state(
                 zorder=zorder+1
             )
 
+    # 静态障碍物使用与碰撞体一致的长宽和朝向，并放在所有动态元素之上。
+    obstacle_face_color = '#8B5A2B'
+    obstacle_edge_color = '#4A2C17'
+    for obstacle in static_obstacles or []:
+        center = np.asarray(obstacle['center'], dtype=float)
+        yaw = float(obstacle['yaw'])
+        length = float(obstacle['length'])
+        width = float(obstacle['width'])
+        forward = np.array([math.cos(yaw), math.sin(yaw)])
+        lateral = np.array([-math.sin(yaw), math.cos(yaw)])
+        corners = np.array([
+            center + forward * length / 2.0 + lateral * width / 2.0,
+            center + forward * length / 2.0 - lateral * width / 2.0,
+            center - forward * length / 2.0 - lateral * width / 2.0,
+            center - forward * length / 2.0 + lateral * width / 2.0,
+        ])
+        polygon = mpatches.Polygon(
+            corners,
+            closed=True,
+            facecolor=obstacle_face_color,
+            edgecolor=obstacle_edge_color,
+            linewidth=1.2,
+            alpha=0.95,
+            zorder=30,
+        )
+        ax.add_patch(polygon)
+
     agent_types = np.argmax(agent_types, axis=1)
     
     # Plot agent bounding boxes and headings
@@ -528,22 +558,26 @@ def render_state(
         rectangle.set_transform(tr)
         ax.add_patch(rectangle)
         
-        # Draw heading line
-        if agent_types[a] in [1, 2]:
-            heading_length = length / 2 + 1.5
-            heading_angle_rad = agent_states[a, 4]
-            vehicle_center = agent_states[a, :2]
-            line_end_x = (vehicle_center[0] + 
-                          heading_length * math.cos(heading_angle_rad))
-            line_end_y = (vehicle_center[1] + 
-                          heading_length * math.sin(heading_angle_rad))
-            ax.plot(
-                [vehicle_center[0], line_end_x], 
-                [vehicle_center[1], line_end_y], 
-                color='black', 
-                zorder=zord+1, 
-                alpha=0.25, 
-                linewidth=0.3 / ((x_max - x_min) / 140))
+        # 为自车和所有其他交通参与者绘制带箭头的朝向标记。
+        heading_length = length / 2 + 1.5
+        heading_angle_rad = agent_states[a, 4]
+        vehicle_center = agent_states[a, :2]
+        line_end = (
+            vehicle_center[0] + heading_length * math.cos(heading_angle_rad),
+            vehicle_center[1] + heading_length * math.sin(heading_angle_rad),
+        )
+        ax.annotate(
+            "",
+            xy=line_end,
+            xytext=vehicle_center,
+            arrowprops={
+                "arrowstyle": "-|>",
+                "color": "black",
+                "alpha": 0.75,
+                "lw": 0.8 / ((x_max - x_min) / 140),
+            },
+            zorder=zord + 1,
+        )
     
         # Add agent ID as text
 
@@ -596,28 +630,31 @@ def render_state(
             zorder=ego_zord, 
             s=8
         )
-    # Plot anchors
-    if anchors is not None and len(anchors) > 0:
-        anchors = np.array(anchors)
+    # LLM 锚点与 Safe-Sim 细化轨迹分别受独立参数控制，开关不影响仿真状态。
+    if show_llm_anchors and anchors is not None and len(anchors) > 0:
+        anchors = np.asarray(anchors)
         ax.scatter(
             anchors[:, 0],
             anchors[:, 1],
             color='blue',
-            label='Anchors',
-            zorder=6,
-            s=20
+            label='LLM Anchors',
+            zorder=12,
+            s=20,
         )
 
-    # Plot diffusion trajectory
-    if diffusion_trajectory is not None and len(diffusion_trajectory) > 0:
-        diffusion_trajectory = np.array(diffusion_trajectory)
+    if (
+        show_diffusion_trajectory
+        and diffusion_trajectory is not None
+        and len(diffusion_trajectory) > 0
+    ):
+        diffusion_trajectory = np.asarray(diffusion_trajectory)
         ax.plot(
             diffusion_trajectory[:, 0],
             diffusion_trajectory[:, 1],
             color='red',
-            label='Diffusion Trajectory',
-            zorder=7,
-            linewidth=1.5
+            label='Safe-Sim Attack Trajectory',
+            zorder=11,
+            linewidth=1.5,
         )
 
     plt.tight_layout()
@@ -641,8 +678,8 @@ def generate_video(name, output_dir, delete_images=False):
     images.sort()  # Sort by filename
 
     # Create a video clip from the image sequence
-    clip = ImageSequenceClip(images, fps=5)
-    # clip = ImageSequenceClip(images, fps=10)
+    # clip = ImageSequenceClip(images, fps=5)
+    clip = ImageSequenceClip(images, fps=10)
     
     # Write the video file
     clip.write_videofile(f"{image_folder}/{name}.mp4", codec='libx264')
