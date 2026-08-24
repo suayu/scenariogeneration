@@ -52,16 +52,13 @@ class PolicyEvaluator:
     
     def compute_metrics(self):
         """ Compute evaluation metrics based on accumulated statistics."""
-        metrics_dict = {
+        base_metrics = {
             'collision rate': np.array(self.collision).astype(float).mean(),
             'off route rate': np.array(self.off_route).astype(float).mean(),
             'completed rate': np.array(self.completed).astype(float).mean(),
             'progress': np.array(self.progress).astype(float).mean()
         }
-        
-        return metrics_dict, ["{}: {:.6f}".format(k,v) for (k,v) in metrics_dict.items()]
-
-        # 获取对抗性安全指标 (碰撞率、险情率、平均最小TTC) 并不需要引入额外指标
+        # 在不改变原有指标含义的前提下，合并 TTC、EA 和可达性指标。
         adv_metrics = self.generator.compute_final_metrics()
 
         all_metrics = {**base_metrics, **adv_metrics}
@@ -90,6 +87,8 @@ class PolicyEvaluator:
 
                 # 2. Safe-Sim 先基于当前快照预测所有受控非自车参与者；Simulator.step 仅执行第一帧。
                 self.env.prepare_background_traffic()
+                # 必须在联合轨迹已准备但尚未执行时，与攻击前同源帧可达集对比。
+                self.generator.evaluate_reachability(self.env)
                 self.generator.set_diffusion_trajectory(
                     self.env.get_attack_target_prediction()
                 )
@@ -108,8 +107,8 @@ class PolicyEvaluator:
                 action = self.policy.act(obs)
                 obs, terminated, info = self.env.step(action, anchors, refined_traj)
 
-                # 3. 调用生成器：评估自车反应 (TTC、险情统计) 似乎不需要单独评估
-                # self.generator.evaluate_reaction(self.env, info)
+                # 4. 采集原有碰撞/TTC指标和新增的二维 EA。
+                self.generator.evaluate_reaction(self.env, info)
 
                 if terminated:
                     self.env.dump_step_data(i)
@@ -117,8 +116,8 @@ class PolicyEvaluator:
 
                 print("step:", current_t, " of ", self.env.steps)
 
-            # 场景结束，记录本回合最小TTC 似乎不需要单独记录
-            # self.generator.finalize_episode_stats()
+            # 场景结束时保留原有的回合最小 TTC 汇总。
+            self.generator.finalize_episode_stats()
             self.update_running_statistics(info)
             
             if self.cfg.visualize:

@@ -1,6 +1,7 @@
 # scenario_generator.py
 import numpy as np
 from policies.llm_adversarial_planner import LLMAdversarialPlanner
+from policies.risk_metrics import AdversarialRiskMetrics
 
 class AdversarialScenarioGenerator:
     """对抗性危险场景生成器：统筹大模型决策、扩散模型细化与评估反馈"""
@@ -40,14 +41,29 @@ class AdversarialScenarioGenerator:
         # 其他状态变量
         self.llm_anchors = None
         self.diffusion_trajectory = None
+        evaluation_cfg = None
+        try:
+            evaluation_cfg = self.cfg.sim.evaluation
+        except AttributeError:
+            pass
+        self.risk_metrics = AdversarialRiskMetrics(evaluation_cfg)
 
     def step(self, env, current_t):
         """在仿真主循环中调用，控制低频决策与轨迹注入"""
         if not self._attacks_enabled:
             return True
 
-        # 根据上一次攻击和查询时间判断当前帧是否需要调用大模型进行攻击规划
-        if ( current_t > self.last_attack_frame + self.attack_duration and current_t > self.last_query_frame + self.attack_frequency ) or current_t == 0:
+        # 攻击帧编号为 0–9；第 10 帧先清除旧动态意图，即使新请求失败也不得继续攻击。
+        attack_window_expired = current_t >= (
+            self.last_attack_frame + self.attack_duration
+        )
+        if attack_window_expired and getattr(env, "attack_intent", None) is not None:
+            env.clear_attack_intent()
+            self.llm_anchors = None
+            self.diffusion_trajectory = None
+
+        # 根据上一次攻击和查询时间判断当前帧是否需要调用大模型进行攻击规划。
+        if (attack_window_expired and current_t > self.last_query_frame + self.attack_frequency) or current_t == 0:
             print(f"[Adversarial Generator] Planning attack at step {current_t}")
             if self._llm_call_times >= self._max_call_times:
                 self._attacks_enabled = False
@@ -106,6 +122,9 @@ class AdversarialScenarioGenerator:
         strategy = attack_plan.get("strategy", "unknown")
         attack_requested = attack_plan.get("attack") is True
         obstacle_plan = attack_plan.get("obstacle_plan", [])
+        # 必须在新障碍物或对抗轨迹进入环境前冻结原始可达集。
+        if obstacle_plan or attack_requested:
+            self.risk_metrics.begin_attack(env)
         if obstacle_plan:
             # 障碍物可作为独立危险源，因此即使 attack 为 false 也允许执行已校验的摆放计划。
             try:
@@ -146,7 +165,8 @@ class AdversarialScenarioGenerator:
         env.set_attack_intent(target_id=target_id, anchors=anchors, strategy=strategy)
 
     def evaluate_reaction(self, env, info):
-        """评估自车反应:收集碰撞、偏航及TTC指标"""
+        """评估自车反应：保留碰撞/TTC统计，并额外采集二维 EA。"""
+        self.risk_metrics.evaluate_ea(env)
         # 记录碰撞
         if info.get('collision', False):
             self.collision_list.append(1.0)
@@ -169,6 +189,10 @@ class AdversarialScenarioGenerator:
         """将当前目标的 Safe-Sim 预测轨迹提供给可视化模块。"""
         self.diffusion_trajectory = trajectory
 
+    def evaluate_reachability(self, env):
+        """在 Safe-Sim 已生成本帧联合轨迹后，计算攻击后可达集。"""
+        return self.risk_metrics.evaluate_dangerous_reachability(env)
+
     def reset_episode_stats(self):
         """每个场景开始前重置单回合统计"""
         self._current_episode_min_ttc = float('inf')
@@ -179,6 +203,7 @@ class AdversarialScenarioGenerator:
         self.last_query_frame = 0
         self.llm_anchors = None
         self.diffusion_trajectory = None
+        self.risk_metrics.reset_episode()
 
     def _read_max_consecutive_llm_failures(self):
         """读取可配置的 LLM 连续服务失败阈值，并保留无配置时的安全默认值。"""
@@ -192,7 +217,7 @@ class AdversarialScenarioGenerator:
         try:
             return str(self.cfg.sim.llm.model_name)
         except AttributeError:
-            return "qwen3.5-27b"
+            return "qwen3-32b"
 
     def finalize_episode_stats(self):
         """场景结束后记录本回合最小TTC"""
@@ -201,11 +226,12 @@ class AdversarialScenarioGenerator:
 
     def compute_final_metrics(self):
         """计算并返回所有场景的最终评估指标"""
-        return {
+        original_metrics = {
             'collision_rate': np.mean(self.collision_list) if self.collision_list else 0.0,
             'near_miss_rate': np.mean(self.near_miss_list) if self.near_miss_list else 0.0,
             'avg_min_ttc': np.mean(self.ttc_list) if self.ttc_list else float('inf')
         }
+        return {**original_metrics, **self.risk_metrics.compute_metrics()}
 
     def _compute_min_ttc(self, env):
         """辅助函数:计算自车与最近活跃他车的最小TTC (简化版)"""

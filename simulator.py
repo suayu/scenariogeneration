@@ -112,13 +112,17 @@ class Simulator:
 
         # 两个开销较大的控制器均随 Simulator 初始化一次，场景切换时只重置内部状态。
         llm_cfg = self.cfg.sim.get('llm')
-        llm_model_name = "qwen3.5-27b" if llm_cfg is None else str(llm_cfg.model_name)
+        llm_model_name = "qwen3-32b" if llm_cfg is None else str(llm_cfg.model_name)
+        llm_model_names = None if llm_cfg is None else list(
+            llm_cfg.get('model_names', [llm_model_name])
+        )
         use_multimodal = False if llm_cfg is None else bool(llm_cfg.multimodal)
         attack_mode = "trajectory_only" if llm_cfg is None else str(
             llm_cfg.get('attack_mode', 'trajectory_only')
         )
         self.llm_planner = LLMAdversarialPlanner(
             model_name=llm_model_name,
+            model_names=llm_model_names,
             use_multimodal=use_multimodal,
             attack_mode=attack_mode,
         )

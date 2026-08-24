@@ -254,8 +254,14 @@ class DiffusionModelWrapper:
         calculators = getattr(root, "loss_calculator_dict", {})
         return calculators.get(name)
 
-    def _select_adversarial_target_id(self, frame, safe_batch, anchor_metadata):
+    def _select_adversarial_target_id(
+        self, frame, safe_batch, anchor_metadata, attack_intent=None
+    ):
         """选择 TTC 对抗目标；LLM 联合模式严格服从大模型的攻击决定。"""
+        if self.guidance_mode == "llm_joint" and attack_intent is not None:
+            target_id = int(attack_intent["target_id"])
+            if target_id in safe_batch.row_to_agent_id:
+                return target_id
         if anchor_metadata.get("active"):
             return int(anchor_metadata["target_id"])
 
@@ -275,6 +281,46 @@ class DiffusionModelWrapper:
 
     def reset(self, scene_id):
         self.scene_id = str(scene_id)
+
+    def _select_joint_guided_action(self, policy_net, model_batch, action, info):
+        """使用全场联合损失为所有交通参与者选择同一个扩散样本。"""
+        samples = info.get("action_samples")
+        if not self.guidance_enabled or not isinstance(samples, dict):
+            return action, None
+        positions = samples.get("positions")
+        yaws = samples.get("yaws")
+        if positions is None or yaws is None or positions.ndim != 4:
+            return action, None
+        batch_size, num_samples, horizon = positions.shape[:3]
+        if batch_size < 2 or num_samples < 2:
+            return action, None
+
+        # Safe-Sim 的第 0 个样本是逐车独立过滤后的拼接结果，不具有联合一致性。
+        state = torch.cat(
+            [
+                positions,
+                torch.zeros_like(positions[..., :1]),
+                yaws[..., :1],
+            ],
+            dim=-1,
+        ).reshape(batch_size * num_samples, horizon, 4)
+        dummy_action = torch.zeros_like(state[..., :2])
+        with torch.no_grad():
+            guidance_data = policy_net._prepare_guidance_data(model_batch)
+            losses = policy_net.Loss_Calculater.calculate_loss(
+                dummy_action,
+                state,
+                guidance_data,
+            ).reshape(batch_size, num_samples, horizon)
+            joint_scores = losses.sum(dim=(0, 2))
+            joint_scores[0] = torch.inf
+            selected_index = int(torch.argmin(joint_scores).item())
+
+        selected_action = type(action)(
+            positions=positions[:, selected_index],
+            yaws=yaws[:, selected_index],
+        )
+        return selected_action, selected_index
 
     def predict(self, frame, attack_intent=None):
         if not isinstance(frame, ScenarioFrame):
@@ -307,12 +353,27 @@ class DiffusionModelWrapper:
         model_batch = dict(safe_batch.data)
         target_mask = torch.zeros((len(safe_batch.row_to_agent_id),), dtype=torch.float32)
         target_id = self._select_adversarial_target_id(
-            frame, safe_batch, anchor_metadata
+            frame, safe_batch, anchor_metadata, attack_intent=attack_intent
         )
         if target_id is not None:
             rows = torch.from_numpy(safe_batch.row_to_agent_id == target_id)
             target_mask[rows] = 1.0
         model_batch["guidance_target_mask"] = target_mask
+        attack_active = torch.zeros_like(target_mask)
+        attack_age_frames = 0
+        if self.guidance_mode == "llm_joint" and attack_intent is not None:
+            source_step = int(attack_intent["source_step"])
+            if source_step > frame.step:
+                raise ValueError("attack intent source_step cannot be later than the current frame")
+            attack_active.copy_(target_mask)
+            attack_age_frames = int(frame.step - source_step)
+        # 运行时攻击阶段仅通过可选张量传入，不改变无攻击或无引导采样路径。
+        model_batch["guidance_attack_active"] = attack_active
+        model_batch["guidance_attack_age_frames"] = torch.full(
+            (len(safe_batch.row_to_agent_id),),
+            attack_age_frames,
+            dtype=torch.int64,
+        )
         model_batch = _move_to_device(model_batch, self.device)
         expected_image_shape = (len(safe_batch.row_to_agent_id), *self.modality_shapes["image"])
         if tuple(model_batch["image"].shape) != expected_image_shape:
@@ -338,6 +399,12 @@ class DiffusionModelWrapper:
         try:
             with inference_context:
                 action, info = self.policy.get_action(model_batch, sample=True)
+                action, joint_sample_index = self._select_joint_guided_action(
+                    policy_net,
+                    model_batch,
+                    action,
+                    info,
+                )
         finally:
             if anchor_loss is not None:
                 anchor_loss.clear_anchor_targets()
@@ -350,11 +417,13 @@ class DiffusionModelWrapper:
                 "num_samples": self.num_samples,
                 "sample_step": self.sample_step,
                 "all_samples_available": "action_samples" in info,
+                "joint_sample_index": joint_sample_index,
                 "guidance_mode": self.guidance_mode,
                 "guidance_enabled": self.guidance_enabled,
                 "guidance_functions": list(self.active_guidance_functions),
                 "adversarial_guidance_active": target_id is not None,
                 "adversarial_guidance_target_id": target_id,
+                "attack_age_frames": attack_age_frames,
                 "anchor_guidance_enabled": self.uses_anchor_guidance,
                 "anchor_guidance_active": anchor_metadata["active"],
                 "anchor_guidance_target_id": anchor_metadata["target_id"],

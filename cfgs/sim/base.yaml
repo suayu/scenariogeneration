@@ -42,7 +42,7 @@ traffic_model:
     params:
       inner_lr: 0.2 # 每个反向扩散步中的引导梯度步长
       inner_beta: 0.5 # 单次引导对控制量的最大修正幅度
-      n_guide_steps: 1 # 每个反向扩散步执行的引导更新次数
+      n_guide_steps: 3 # 每个反向扩散步执行三次引导，使强安全屏障充分生效
       scale_grad_by_std: True # 按当前扩散噪声方差缩放梯度
       grad_wrt: clean_guide
     default:
@@ -60,6 +60,19 @@ traffic_model:
         loss_timesteps: 20
         filter_timesteps: 20
         loss_scale: 1.0
+        attack_protection_frames: 2 # LLM 发起攻击后的第 0–1 帧完整保持攻击者—自车安全间距
+        attack_relaxation_frames: 6 # 第 2–7 帧线性减弱安全间距约束，第 7 帧降为零
+        attack_contact_ramp_frames: 2 # 第 8–9 帧增强受控接触，并将接触目标移到下一预测步
+        controlled_contact_penetration: 0.05 # 接触目标仅允许五厘米几何重叠，避免高速穿模
+        max_contact_penetration: 0.15 # 全阶段保留的硬穿透上限，防止攻击者穿过自车
+        contact_loss_scale: 1.0 # 末段受控接触损失强度
+        penetration_loss_scale: 5.0 # 深度穿透惩罚强度
+        safety_penetration_loss_scale: 100.0 # 背景车互撞和非攻击车撞自车的强穿透屏障
+        max_speed: 20.0 # 所有背景车辆允许的最大速度，单位为米每秒
+        max_acceleration: 6.0 # 所有背景车辆允许的最大加速度模长，单位为米每二次方秒
+        max_jerk: 12.0 # 所有背景车辆允许的最大加加速度模长，单位为米每三次方秒
+        max_step_distance: 2.0 # 单帧最大位移，单位为米，用于直接拦截瞬移
+        kinematics_loss_scale: 1.0 # 运动学异常惩罚强度
       route:
         lane_margin: 1.0
         nonlinear_factor: 5.0
@@ -89,11 +102,44 @@ traffic_model:
     guide_steps: 1 # 每个反向扩散步执行的引导更新次数
     scale_grad_by_std: True # 按当前扩散噪声方差缩放梯度
 llm:
-  model_name: qwen3.5-27b # 可通过 sim.llm.model_name=<模型名> 覆盖，便于切换免费模型
+  model_name: qwen3-32b # 首选模型；成功后会在当前仿真器生命周期内保持优先
+  # 首选模型不可用、无权限、超额度或服务异常时，按下列顺序自动切换。
+  model_names:
+    - qwen3-32b
+    - qwen3.7-flash-2026-07-15
+    - qwen3.5-plus-2026-04-20
+    - qwen3.5-122b-a10b
+    - qwen3.5-plus-2026-02-15
+    - qwen3.5-397b-a17b
+    - qwen3.5-flash
+    - qwen3.6-flash-2026-04-16
   multimodal: False # False 为纯文本模式；True 为当前帧图像加结构化场景数据
   attack_mode: trajectory_only # trajectory_only、obstacle_only、joint；决定每次查询允许的攻击类型
   max_consecutive_failures: 3 # 连续服务/API失败达到该次数后，本场景不再调用 LLM
   obstacles:
     enabled: False # 兼容旧配置；新逻辑以 llm.attack_mode 为准
+evaluation:
+  ea:
+    enabled: True # 保留 TTC 的同时，额外计算二维联合规避加速度
+    horizon_seconds: 7.0 # 与 EA 论文实验设置一致的预测时域
+    timestep_seconds: 0.02 # 使用论文公开实现的精细碰撞检查步长
+    max_acceleration: 100.0
+    coarse_directions: 72
+    fine_directions: 51
+    fine_half_window_degrees: 5.0
+    tolerance: 0.001
+  reachability:
+    enabled: True
+    horizon_seconds: 3.0 # 与 Safe-Sim 3.2 秒短时预测基本对齐
+    timestep_seconds: 0.5
+    longitudinal_resolution: 1.0
+    lateral_resolution: 0.5
+    speed_resolution: 1.0
+    lateral_speed_resolution: 0.5
+    lane_half_width: 4.0 # 以自车路由为中心的可行驶带半宽
+    max_speed: 25.0
+    max_lateral_speed: 3.0
+    longitudinal_accelerations: [-4.0, -2.0, 0.0, 2.0]
+    lateral_accelerations: [-2.5, 0.0, 2.5]
 save_carla_data: True # whether to save out .dat files for CARLA replay (for visualizing in CARLA)
 scenario_data_output_path: './carla_maps' # 保存 CARLA 回放数据的目录

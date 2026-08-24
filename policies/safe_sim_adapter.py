@@ -220,6 +220,13 @@ class SafeSimBatchAdapter:
             frame, controlled_ids, agent_from_world
         )
         speeds = np.linalg.norm(controlled_states[:, 2:4], axis=-1).astype(np.float32)
+        current_accelerations_world = np.zeros((batch_size, 2), dtype=np.float32)
+        for row, agent_id in enumerate(controlled_ids):
+            if frame.history_mask[agent_id, -2:].all():
+                current_accelerations_world[row] = (
+                    frame.history_global[agent_id, -1, 2:4]
+                    - frame.history_global[agent_id, -2, 2:4]
+                ) / frame.dt
         raster_from_agent = np.repeat(
             np.array(
                 [
@@ -244,6 +251,10 @@ class SafeSimBatchAdapter:
             "agent_hist": torch.from_numpy(agent_hist),
             "neigh_hist": torch.from_numpy(neigh_hist),
             "curr_speed": torch.from_numpy(speeds),
+            # 传入上一真实帧加速度，使闭环重规划边界也能计算 jerk。
+            "scenario_curr_acceleration_world": torch.from_numpy(
+                current_accelerations_world
+            ),
             "dt": torch.full((batch_size,), float(frame.dt), dtype=torch.float32),
             "centroid": torch.from_numpy(controlled_states[:, :2].astype(np.float32)),
             "yaw": torch.from_numpy(controlled_states[:, 4].astype(np.float32)),

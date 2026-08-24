@@ -1,4 +1,142 @@
-# Official Repository for Scenario Dreamer
+# 基于 LLM 与扩散模型的对抗性危险场景生成
+
+本分支在 Scenario Dreamer 闭环仿真器上集成了 LLM 高级攻击规划、Safe-Sim 多交通参与者联合扩散生成、静态障碍物调度和危险性评估，用于为指定自动驾驶策略生成可解释的挑战性测试场景。
+
+> 本项目的起点是 Scenario Dreamer 官方仓库。本 README 首先介绍对抗性场景生成分支；下方保留了上游项目的完整说明。
+
+## 主要流程
+
+1. **Scenario Dreamer 维护唯一环境状态**：`Simulator` 负责自车、其他交通参与者、道路、历史轨迹、静态障碍物和碰撞终止状态。
+2. **LLM 低频生成高级攻击意图**：根据结构化场景状态和 `attack_request.txt` 中的用户指令，选择攻击对象、攻击策略、稀疏轨迹锚点和静态障碍物模板。LLM 返回的计划需通过格式、目标、几何和短时动力学校验。
+3. **Safe-Sim 生成联合轨迹**：数据适配器将 Scenario Dreamer 的全局场景和历史状态转换为 Safe-Sim 批次。扩散模型每次联合生成所有活跃非自车参与者的短时轨迹。
+4. **在线 guidance 细化危险性**：可组合背景车防碰撞、非攻击车辆与自车防碰撞、路线、TTC、运动学和 LLM 锚点损失。攻击者在 10 帧攻击窗口内先正常接近，再逐步减小安全间距，第 8 帧后才鼓励受控接触，同时抑制高速穿模、瞬移和深度穿透。
+5. **闭环执行**：仿真器每帧只执行联合轨迹的第一步，然后使用新环境状态重新扩散推理。自车由现有 IDM 或 RL 策略控制；发生碰撞时立即终止该场景并统计结果。
+6. **评估**：保留碰撞率、偏离率、进度、险情率和 TTC，额外计算二维 Evasive Acceleration（EA）、攻击前后可达面积、场景是否有解以及困难度：
+
+   ```text
+   困难度 = 1 - 危险场景可达面积 / 原始场景可达面积
+   ```
+
+## 依赖与本地资源
+
+本仓库只保存正式流程源码和必要配置。以下大型或外部资源不会提交到 GitHub：
+
+- `safe-sim/` 外部工作树及其扩散模型权重；
+- `metadata/simulation_environment_datasets/` 仿真数据集；
+- `Carla/`、`gpudrive/` 等外部仿真器或工作树；
+- `*.ckpt`、`*.pt`、`*.pth`、视频、图像、日志和仿真输出。
+
+开始前需准备：
+
+- Scenario Dreamer Conda 环境；
+- Safe-Sim 源码与匹配的 checkpoint，路径与 `cfgs/sim/base.yaml` 一致；
+- Scenario Dreamer 仿真场景 pickle 数据；
+- 可访问兼容 OpenAI API 的 LLM 服务。
+
+## 启动前配置
+
+```bash
+cd /home2/zhaoyx/scenario-dreamer
+conda activate scenario-dreamer
+
+export PROJECT_ROOT=/home2/zhaoyx/scenario-dreamer
+export SCRATCH_ROOT=/home2/zhaoyx/scenario-dreamer
+export DATASET_ROOT=/home2/zhaoyx/scenario-dreamer/metadata
+export PYTHONPATH=$PROJECT_ROOT:$PROJECT_ROOT/safe-sim:$PROJECT_ROOT/safe-sim/trajdata/src
+
+# 密钥只通过环境变量传入，不要写入代码、README 或提交记录。
+export LLM_API_KEY='<your-api-key>'
+export LLM_BASE_URL='https://<your-openai-compatible-endpoint>/v1'
+```
+
+在项目根目录创建本地文件 `attack_request.txt`，每行一条对抗场景指令。该文件已加入 `.gitignore`，不会上传。示例：
+
+```text
+生成一个兼顾对抗轨迹和静态障碍物的安全关键场景。
+```
+
+## 启动测试
+
+### 1. 完整联合对抗模式（推荐）
+
+LLM 同时规划轨迹锚点和静态障碍物，Safe-Sim 使用碰撞、路线、TTC、运动学和 LLM 锚点联合 guidance：
+
+```bash
+python run_simulation.py \
+  sim.llm.attack_mode=joint \
+  sim.traffic_model.guidance.mode=llm_joint \
+  sim.visualize=True \
+  sim.lightweight=True \
+  sim.verbose=True
+```
+
+### 2. 纯轨迹对抗模式
+
+```bash
+python run_simulation.py \
+  sim.llm.attack_mode=trajectory_only \
+  sim.traffic_model.guidance.mode=llm_joint \
+  sim.visualize=True \
+  sim.lightweight=True \
+  sim.verbose=True
+```
+
+### 3. 切换扩散 guidance
+
+`sim.traffic_model.guidance.mode` 支持：
+
+- `unguided`：不使用在线 guidance 损失；
+- `default`：使用碰撞、路线和 TTC 等默认损失，不使用 LLM 锚点；
+- `llm_joint`：默认损失与 LLM 锚点联合引导；
+- `manual`：严格按 `cfgs/sim/base.yaml` 中 `manual.functions` 和 `manual.weights` 组合损失。
+
+例如，不使用在线 guidance：
+
+```bash
+python run_simulation.py \
+  sim.llm.attack_mode=trajectory_only \
+  sim.traffic_model.guidance.mode=unguided \
+  sim.visualize=False \
+  sim.verbose=True
+```
+
+### 4. 常用参数
+
+```bash
+# 切换自车策略
+sim.policy=idm                         # IDM 自车
+sim.policy=rl                          # RL 自车
+
+# LLM 模式
+sim.llm.multimodal=False               # 默认纯文本模式
+sim.llm.multimodal=True                # 加入当前帧渲染图像
+sim.llm.attack_mode=obstacle_only      # 只调度静态障碍物
+
+# 可视化内容
+sim.visualization.show_llm_anchors=True
+sim.visualization.show_diffusion_trajectory=True
+
+# 调试时减少扩散候选数可缩短运行时间
+sim.traffic_model.num_samples=5
+```
+
+默认可视化输出位于 `movies/`，逐帧仿真记录位于 `carla_maps/step_data/`。这些运行产物均不会提交到 GitHub。
+
+## 代码入口
+
+- `run_simulation.py`：仿真评估入口；
+- `simulator.py`：唯一环境状态、闭环步进与碰撞终止；
+- `scenario_generator.py`：低频 LLM 调度、攻击意图注入和指标汇总；
+- `policies/llm_adversarial_planner.py`：LLM Prompt、模型自动切换、计划校验和坐标变换；
+- `policies/diffusion_model_wrapper.py`：Safe-Sim 扩散推理和 guidance 生命周期；
+- `policies/safe_sim_adapter.py`：Scenario Dreamer 与 Safe-Sim 之间的强类型数据适配；
+- `policies/scenario_guidance.py`：联合损失、攻击阶段调度和运动学约束；
+- `policies/risk_metrics.py`：EA 与路由坐标可达性评估；
+- `policies/obstacles.py` 和 `policies/obstacle_wrapper.py`：静态障碍物模板及仿真器适配接口。
+
+---
+
+# Scenario Dreamer 上游项目说明
 
 <p align="left">
 <a href="https://arxiv.org/abs/2503.22496" alt="arXiv">

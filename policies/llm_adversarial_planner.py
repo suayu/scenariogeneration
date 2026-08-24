@@ -8,14 +8,35 @@ from policies.obstacles import ObstacleCatalog, ObstaclePlacement
 class LLMAdversarialPlanner:
     """基于大模型的对抗性策略规划器"""
     ATTACK_MODES = {"trajectory_only", "obstacle_only", "joint"}
+    FREE_MODEL_POOL = (
+        "qwen3-32b",
+        "qwen3.7-flash-2026-07-15",
+        "qwen3.5-plus-2026-04-20",
+        "qwen3.5-122b-a10b",
+        "qwen3.5-plus-2026-02-15",
+        "qwen3.5-397b-a17b",
+        "qwen3.5-flash",
+        "qwen3.6-flash-2026-04-16",
+    )
 
-    def __init__(self, model_name="qwen3.5-27b", client=None, use_multimodal=False,
-                 use_obstacles=False, attack_mode=None):
+    def __init__(self, model_name="qwen3-32b", model_names=None, client=None,
+                 use_multimodal=False, use_obstacles=False, attack_mode=None):
         """
             LLM的输入输出全部基于局部坐标系,局部坐标系的原点为自车位置,y轴正方向为自车朝向。
             LLM类方法的输入输出全部基于全局坐标系,全局坐标系的原点为地图原点,y轴正方向为地图北方。因此需要在调用LLM前将环境状态归一化到局部坐标系,并在获取LLM输出后将其转换回全局坐标系。
         """
-        self.model_name = model_name
+        # 显式候选池用于生产配置；直接构造时则允许将指定模型置于首位，便于测试。
+        if model_names is None:
+            requested_models = [model_name, *self.FREE_MODEL_POOL]
+        else:
+            requested_models = list(model_names)
+            if model_name and model_name not in requested_models:
+                requested_models.insert(0, model_name)
+        self.model_names = tuple(dict.fromkeys(str(name) for name in requested_models if name))
+        if not self.model_names:
+            raise ValueError("大模型候选列表不能为空")
+        self._preferred_model_index = 0
+        self.model_name = self.model_names[0]
         self.last_error = None
         # 仅在连接、鉴权、额度或服务端错误时置位；格式校验失败不代表服务不可用。
         self.last_request_failed = False
@@ -28,7 +49,8 @@ class LLMAdversarialPlanner:
         # 模式优先于旧开关，避免仅障碍物模式被旧配置意外关闭。
         self.use_obstacles = self.attack_mode in {"obstacle_only", "joint"}
         self.obstacle_catalog = ObstacleCatalog()
-        api_key = os.getenv("API_KEY", "sk-ws-H.EDIRXYI.CIQJ.MEQCIEMNMXNJhnr1bIUzENhRdivO3EEcLzTP8YnG21XC2MctAiAOi080BKTRkI7Wjn_sSJACVvlIOdrUHbvExwrO3Pu-DQ")
+        # 凭据只从环境变量读取，禁止将密钥写入源码或版本库。
+        api_key = os.getenv("LLM_API_KEY") or os.getenv("API_KEY")
         if client is not None:
             self.client = client
             self.available = True
@@ -41,8 +63,8 @@ class LLMAdversarialPlanner:
         else:
             self.client = None
             self.available = False
-            self.last_error = "服务器未设置 LLM_API_KEY"
-            print("[大模型规划器] 未设置 LLM_API_KEY,本次运行将停用高级攻击规划,但仿真会继续。")
+            self.last_error = "服务器未设置 LLM_API_KEY 或 API_KEY"
+            print("[大模型规划器] 未设置 LLM_API_KEY 或 API_KEY，本次运行将停用高级攻击规划，但仿真会继续。")
         self._use_local_coordinate = True  # 是否将环境状态归一化到以自车为中心的局部坐标系
 
     def _normalize_env_state(self, env_state_json):
@@ -546,13 +568,13 @@ Current scene state:
                 text = "\n".join(lines[1:-1]).strip()
         return json.loads(text)
 
-    def _request_attack_plan(self, prompt, scene_image=None):
-        """根据显式模式开关执行纯文本或多模态请求。"""
+    def _request_attack_plan_once(self, model_name, prompt, scene_image=None):
+        """使用单个指定模型执行一次纯文本或多模态请求。"""
         if self.use_multimodal:
             if scene_image is None:
                 raise ValueError("多模态模式已开启，但未提供当前帧渲染")
             response = self.client.chat.completions.create(
-                model=self.model_name,
+                model=model_name,
                 messages=[{
                     "role": "user",
                     "content": [
@@ -574,11 +596,46 @@ Current scene state:
                 raise ValueError(f"无法将多模态大模型输出解析为 JSON：{raw}") from e
 
         response = self.client.responses.create(
-            model=self.model_name,
+            model=model_name,
             input=prompt,
             extra_body={"enable_thinking": False},
         )
         return self._extract_reasoning_and_result(response)
+
+    def _request_attack_plan(self, prompt, scene_image=None):
+        """按候选池轮换模型，服务、额度或模型可用性失败时自动切换。"""
+        last_service_error = None
+        candidate_count = len(self.model_names)
+        for offset in range(candidate_count):
+            model_index = (self._preferred_model_index + offset) % candidate_count
+            model_name = self.model_names[model_index]
+            try:
+                result = self._request_attack_plan_once(model_name, prompt, scene_image)
+            except Exception as error:
+                if not self._is_service_failure(error):
+                    raise
+                last_service_error = error
+                status_code = getattr(error, "status_code", None)
+                status_text = "未知状态" if status_code is None else str(status_code)
+                print(
+                    f"[大模型规划器] 模型 {model_name} 暂不可用"
+                    f"(状态 {status_text})，正在切换候选模型。"
+                )
+                continue
+            self._preferred_model_index = model_index
+            self.model_name = model_name
+            return result
+        if last_service_error is not None:
+            raise last_service_error
+        raise RuntimeError("没有可用的大模型候选项")
+
+    def _advance_after_invalid_plan(self):
+        """当模型可调用但连续输出不合同计划时，下次查询改用后续候选模型。"""
+        if len(self.model_names) <= 1:
+            return
+        self._preferred_model_index = (self._preferred_model_index + 1) % len(self.model_names)
+        self.model_name = self.model_names[self._preferred_model_index]
+        print(f"[大模型规划器] 下次规划将改用候选模型 {self.model_name}。")
 
     @staticmethod
     def _validate_attack_plan(attack_plan, normalized_env_state):
@@ -742,6 +799,9 @@ Current scene state:
         except Exception as e:
             self.last_error = str(e)
             self.last_request_failed = self._is_service_failure(e)
+            if isinstance(e, ValueError) and not self.last_request_failed:
+                # 语义/动力学校验失败不计入服务熔断，但避免后续一直使用同一不合同模型。
+                self._advance_after_invalid_plan()
             print(f"[大模型规划器] 本次高级攻击规划失败，已跳过且仿真继续：{e}")
             return None
 
@@ -749,8 +809,19 @@ Current scene state:
     def _is_service_failure(error):
         """判断异常是否表示 LLM 服务暂不可用，而非模型计划本身不合规。"""
         status_code = getattr(error, "status_code", None)
-        if status_code in {401, 403, 408, 429} or (isinstance(status_code, int) and status_code >= 500):
+        if status_code in {401, 403, 404, 408, 429} or (isinstance(status_code, int) and status_code >= 500):
             return True
+        if status_code == 400:
+            # 部分 OpenAI 兼容网关会用 400 表示单个模型未部署，这种情况应继续轮换。
+            message = str(error).lower()
+            if any(token in message for token in (
+                "unsupported model",
+                "model not found",
+                "model_not_found",
+                "invalid model",
+                "does not exist",
+            )):
+                return True
         return type(error).__name__ in {
             "APIConnectionError",
             "APITimeoutError",
