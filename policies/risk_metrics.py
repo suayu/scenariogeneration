@@ -13,6 +13,21 @@ from itertools import product
 import numpy as np
 
 
+DEFAULT_DANGER_SCORE_WEIGHTS = {
+    "collision": 0.30,
+    "near_miss": 0.15,
+    "min_ttc": 0.15,
+    "max_ea": 0.12,
+    "mean_ea": 0.04,
+    "max_reachability_difficulty": 0.12,
+    "mean_reachability_difficulty": 0.04,
+    "unsolvable": 0.05,
+    "off_route": 0.01,
+    "incomplete": 0.01,
+    "low_progress": 0.01,
+}
+
+
 def _config_value(config, name, default):
     """同时兼容 OmegaConf、字典和缺省配置。"""
     if config is None:
@@ -20,6 +35,86 @@ def _config_value(config, name, default):
     if isinstance(config, dict):
         return config.get(name, default)
     return getattr(config, name, default)
+
+
+def compute_scenario_danger_score(metrics, config=None):
+    """将异量纲危险性指标归一化并计算零到一之间的综合得分。"""
+    weights_config = _config_value(config, "weights", None)
+    weights = {
+        name: float(_config_value(weights_config, name, default))
+        for name, default in DEFAULT_DANGER_SCORE_WEIGHTS.items()
+    }
+    if any(weight < 0.0 for weight in weights.values()):
+        raise ValueError("场景危险性综合得分的权重不能为负数")
+
+    ttc_scale = float(_config_value(config, "ttc_scale_seconds", 3.0))
+    ea_scale = float(_config_value(config, "ea_scale_mps2", 3.0))
+    if ttc_scale <= 0.0 or ea_scale <= 0.0:
+        raise ValueError("TTC 和 EA 的归一化尺度必须为正数")
+
+    components = []
+
+    def append_component(name, value):
+        """仅汇总数值有效且权重大于零的分量。"""
+        value = float(value)
+        weight = weights[name]
+        if weight > 0.0 and np.isfinite(value):
+            components.append((weight, float(np.clip(value, 0.0, 1.0))))
+
+    # 两个碰撞率名称属于同一事件的不同统计口径，优先采用场景级口径，避免重复计权。
+    collision = metrics.get("collision rate", metrics.get("collision_rate"))
+    if collision is not None:
+        append_component("collision", collision)
+    if "near_miss_rate" in metrics:
+        append_component("near_miss", metrics["near_miss_rate"])
+
+    # 驾驶质量采用较低权重；完成率和进度需反向转换为危险度。
+    if "off route rate" in metrics:
+        append_component("off_route", metrics["off route rate"])
+    if "completed rate" in metrics:
+        append_component("incomplete", 1.0 - float(metrics["completed rate"]))
+    if "progress" in metrics:
+        append_component("low_progress", 1.0 - float(metrics["progress"]))
+
+    # TTC 越小越危险；无穷大表示预测时域内没有碰撞趋势，对应零危险度。
+    if "avg_min_ttc" in metrics:
+        ttc = float(metrics["avg_min_ttc"])
+        if math.isinf(ttc) and ttc > 0.0:
+            append_component("min_ttc", 0.0)
+        elif np.isfinite(ttc):
+            append_component("min_ttc", 1.0 / (1.0 + max(ttc, 0.0) / ttc_scale))
+
+    # EA 使用饱和映射，避免少量极端加速度无上限地支配综合得分。
+    ea_metric_names = {
+        "max_ea": "max_evasive_acceleration_mps2",
+        "mean_ea": "mean_evasive_acceleration_mps2",
+    }
+    for component_name, metric_name in ea_metric_names.items():
+        if metric_name in metrics and np.isfinite(float(metrics[metric_name])):
+            ea = max(float(metrics[metric_name]), 0.0)
+            append_component(component_name, 1.0 - math.exp(-ea / ea_scale))
+
+    # 未发生可达性评估事件时，默认的 solvable=0 不代表场景无解，因此跳过可达性分量。
+    reachability_count = float(metrics.get("reachability_event_count", 0.0))
+    if reachability_count > 0.0:
+        if "reachability_difficulty" in metrics:
+            append_component(
+                "max_reachability_difficulty", metrics["reachability_difficulty"]
+            )
+        if "mean_reachability_difficulty" in metrics:
+            append_component(
+                "mean_reachability_difficulty",
+                metrics["mean_reachability_difficulty"],
+            )
+        if "dangerous_scene_solvable" in metrics:
+            solvable = float(metrics["dangerous_scene_solvable"])
+            if np.isfinite(solvable):
+                append_component("unsolvable", 1.0 - np.clip(solvable, 0.0, 1.0))
+
+    total_weight = sum(weight for weight, _ in components)
+    if total_weight <= 0.0:
+        return 0.0
+    return float(sum(weight * value for weight, value in components) / total_weight)
 
 
 def _wrap_angle(angle):
@@ -522,6 +617,9 @@ class AdversarialRiskMetrics:
                 "original_reachable_area_m2": hardest["original_area_m2"],
                 "dangerous_reachable_area_m2": hardest["dangerous_area_m2"],
                 "reachability_difficulty": hardest["difficulty"],
+                "mean_reachability_difficulty": float(np.mean([
+                    event["difficulty"] for event in finite_events
+                ])),
                 "dangerous_scene_solvable": float(hardest["dangerous_solvable"]),
             })
         else:
@@ -529,6 +627,7 @@ class AdversarialRiskMetrics:
                 "original_reachable_area_m2": 0.0,
                 "dangerous_reachable_area_m2": 0.0,
                 "reachability_difficulty": float("nan"),
+                "mean_reachability_difficulty": float("nan"),
                 "dangerous_scene_solvable": 0.0,
             })
         return metrics

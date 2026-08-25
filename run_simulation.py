@@ -12,6 +12,7 @@ from utils.viz import generate_video
 import json
 import os
 from scenario_generator import AdversarialScenarioGenerator
+from policies.risk_metrics import compute_scenario_danger_score
 
 class PolicyEvaluator:
     """ Evaluate a given policy in a simulation environment over multiple scenarios."""
@@ -62,6 +63,12 @@ class PolicyEvaluator:
         adv_metrics = self.generator.compute_final_metrics()
 
         all_metrics = {**base_metrics, **adv_metrics}
+        # 将所有独立危险性指标汇总为统一的零到一综合得分。
+        composite_cfg = getattr(getattr(self.cfg, "evaluation", None), "composite", None)
+        all_metrics["scenario_danger_score"] = compute_scenario_danger_score(
+            all_metrics,
+            composite_cfg,
+        )
         return all_metrics, ["{}: {:.6f}".format(k,v) for (k,v) in all_metrics.items()]
 
     def evaluate_policy(self):

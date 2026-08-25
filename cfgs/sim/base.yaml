@@ -119,6 +119,22 @@ llm:
   obstacles:
     enabled: False # 兼容旧配置；新逻辑以 llm.attack_mode 为准
 evaluation:
+  composite:
+    # 各项先归一化到零到一，再按有效权重重新归一化并求加权平均。
+    weights:
+      collision: 0.30
+      near_miss: 0.15
+      min_ttc: 0.15
+      max_ea: 0.12
+      mean_ea: 0.04
+      max_reachability_difficulty: 0.12
+      mean_reachability_difficulty: 0.04
+      unsolvable: 0.05
+      off_route: 0.01
+      incomplete: 0.01
+      low_progress: 0.01
+    ttc_scale_seconds: 3.0 # TTC 危险度达到 0.5 时对应的 TTC
+    ea_scale_mps2: 3.0 # EA 指数饱和映射的特征尺度
   ea:
     enabled: True # 保留 TTC 的同时，额外计算二维联合规避加速度
     horizon_seconds: 7.0 # 与 EA 论文实验设置一致的预测时域

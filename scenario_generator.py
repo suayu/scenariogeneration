@@ -170,6 +170,8 @@ class AdversarialScenarioGenerator:
         # 记录碰撞
         if info.get('collision', False):
             self.collision_list.append(1.0)
+            # 碰撞是近失事件的最严重结果，因此同时计入近失率。
+            self.near_miss_list.append(1.0)
         else:
             self.collision_list.append(0.0)
             # 若未碰撞，计算并记录TTC (Time-to-Collision)
@@ -252,11 +254,11 @@ class AdversarialScenarioGenerator:
             # 计算相对距离与相对速度
             dist = np.sqrt(dx**2 + dy**2)
             rel_speed = np.sqrt(rel_vx**2 + rel_vy**2)
-            # 简化判断：若相对速度方向与距离方向一致(即靠近)，则计算TTC
-            if rel_speed > 0.1:
-                approach_rate = (dx * rel_vx + dy * rel_vy) / dist
-                if approach_rate > 0:
-                    ttc = dist / approach_rate
+            # 距离导数为 r·v_rel/|r|；其为负时距离缩短，闭合速度取相反数。
+            if rel_speed > 0.1 and dist > 1e-6:
+                closing_speed = -(dx * rel_vx + dy * rel_vy) / dist
+                if closing_speed > 0:
+                    ttc = dist / closing_speed
                     if ttc < min_ttc:
                         min_ttc = ttc
         return min_ttc
