@@ -361,6 +361,37 @@ def register_scenario_guidance():
                         * self.contact_loss_scale
                     )
 
+                static_obstacles = params.get("static_obstacles_world")
+                static_obstacle_mask = params.get("static_obstacle_mask")
+                if static_obstacles is not None and static_obstacles.shape[1] > 0:
+                    # 使用障碍物外接圆半径：保守、可微，且不改变原有车辆矩形碰撞逻辑。
+                    obstacles = static_obstacles.to(device=world.device, dtype=world.dtype)
+                    obstacle_mask = static_obstacle_mask.to(device=world.device, dtype=torch.bool)
+                    obstacles = obstacles.reshape(batch_size, num_samples, -1, 5)
+                    obstacle_mask = obstacle_mask.reshape(batch_size, num_samples, -1)
+                    obstacle_radii = 0.5 * torch.linalg.norm(obstacles[..., 3:5], dim=-1)
+                    obstacle_distance = torch.linalg.norm(
+                        world[:, :, :, None, :] - obstacles[:, :, None, :, :2],
+                        dim=-1,
+                    )
+                    obstacle_margin = (
+                        radii[:, None, None, None]
+                        + obstacle_radii[:, :, None, :]
+                        + self.safety_margin
+                    )
+                    obstacle_penalty = F.softplus(
+                        (obstacle_margin - obstacle_distance) / self.temperature
+                    ) * self.temperature
+                    obstacle_overlap = F.relu(
+                        radii[:, None, None, None] + obstacle_radii[:, :, None, :]
+                        - obstacle_distance
+                    )
+                    obstacle_penalty = obstacle_penalty + (
+                        obstacle_overlap.square() * self.safety_penetration_loss_scale
+                    )
+                    obstacle_penalty = obstacle_penalty * obstacle_mask[:, :, None, :].to(world.dtype)
+                    loss = loss + obstacle_penalty.sum(dim=-1)
+
                 # 运动学约束在所有阶段和所有背景车辆上始终有效。
                 loss = loss + self._kinematics_loss(
                     world, params, batch_size, num_samples

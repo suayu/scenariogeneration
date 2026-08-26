@@ -39,6 +39,10 @@ class ScenarioFrame:
     lanes_global: np.ndarray
     route_global: np.ndarray
     ego_state_global: np.ndarray = None
+    # LLM 放置的静态障碍物，使用全局 [x, y, yaw, length, width] 表示。
+    static_obstacles_global: np.ndarray = field(
+        default_factory=lambda: np.empty((0, 5), dtype=np.float32)
+    )
 
     def __post_init__(self):
         _require_shape("agent_ids", self.agent_ids, 1)
@@ -51,6 +55,7 @@ class ScenarioFrame:
         _require_shape("route_global", self.route_global, 2, (2,))
         if self.ego_state_global is not None:
             _require_shape("ego_state_global", self.ego_state_global, 1, (SCENARIO_STATE_DIM,))
+        _require_shape("static_obstacles_global", self.static_obstacles_global, 2, (5,))
 
         agent_count = self.states_global.shape[0]
         expected_first_dims = {

@@ -104,6 +104,33 @@ class SafeSimBatchAdapter:
         if len(pixels) >= 2:
             cv2.polylines(image, [pixels.reshape(-1, 1, 2)], False, float(value), thickness, cv2.LINE_AA)
 
+    def _draw_static_obstacle(self, image, obstacle, transform, value=-1.0):
+        """将全局静态障碍物绘制到既有动态参与者通道，不增加模型输入通道。"""
+        center_local = _transform_points(np.asarray(obstacle[:2]), transform)
+        heading_local = transform[:2, :2] @ np.array(
+            [math.cos(float(obstacle[2])), math.sin(float(obstacle[2]))],
+            dtype=np.float32,
+        )
+        yaw_local = math.atan2(float(heading_local[1]), float(heading_local[0]))
+        half_length = float(obstacle[3]) * 0.5
+        half_width = float(obstacle[4]) * 0.5
+        corners = np.array(
+            [
+                [-half_length, -half_width],
+                [half_length, -half_width],
+                [half_length, half_width],
+                [-half_length, half_width],
+            ],
+            dtype=np.float32,
+        )
+        rotation = np.array(
+            [[math.cos(yaw_local), -math.sin(yaw_local)],
+             [math.sin(yaw_local), math.cos(yaw_local)]],
+            dtype=np.float32,
+        )
+        pixels = self._to_pixels(center_local + corners @ rotation.T)
+        cv2.fillConvexPoly(image, pixels.reshape(-1, 1, 2), float(value))
+
     def _nearest_centerline(self, frame, agent_state, transform):
         lanes = frame.lanes_global
         if lanes.size == 0:
@@ -156,6 +183,11 @@ class SafeSimBatchAdapter:
                     if 0 <= pixel[0] < self.raster_size and 0 <= pixel[1] < self.raster_size:
                         value = 1.0 if other_id == agent_id else -1.0
                         cv2.circle(image[row, hist_idx], tuple(pixel), 1, value, -1)
+
+            # 障碍物在每个历史切片保持占用，复用“其他参与者”为负值的语义。
+            for hist_idx in range(self.history_frames):
+                for obstacle in frame.static_obstacles_global:
+                    self._draw_static_obstacle(image[row, hist_idx], obstacle, transform)
 
             centerline, has_lane, initial_heading = self._nearest_centerline(frame, focal_state, transform)
             centerlines.append(centerline)
@@ -256,6 +288,9 @@ class SafeSimBatchAdapter:
         current_reference[:, 0, :2] = controlled_states[:, :2]
         current_reference[:, 0, 2] = speeds
 
+        static_obstacles = np.asarray(frame.static_obstacles_global, dtype=np.float32)
+        static_obstacle_mask = np.ones(static_obstacles.shape[0], dtype=bool)
+
         data = {
             "image": torch.from_numpy(image),
             "agent_hist": torch.from_numpy(agent_hist),
@@ -278,6 +313,13 @@ class SafeSimBatchAdapter:
             ),
             "raster_from_agent": torch.from_numpy(raster_from_agent),
             "world_from_agent": torch.from_numpy(world_from_agent),
+            # 每个受控车辆共享同一组全局障碍物；mask 允许空障碍物批次。
+            "static_obstacles_world": torch.from_numpy(
+                np.repeat(static_obstacles[None], batch_size, axis=0)
+            ),
+            "static_obstacle_mask": torch.from_numpy(
+                np.repeat(static_obstacle_mask[None], batch_size, axis=0)
+            ),
             # 所有预测行均属于当前同一个仿真场景，供多车联合损失建立配对关系。
             "scene_index": torch.zeros((batch_size,), dtype=torch.int64),
             "extras": {

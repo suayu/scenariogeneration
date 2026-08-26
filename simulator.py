@@ -270,6 +270,23 @@ class Simulator:
             history_global[:, target_index] = np.asarray(states, dtype=np.float32)
             history_mask[:, target_index] = np.asarray(active, dtype=bool)
 
+        obstacle_rows = [
+            [
+                float(obstacle["center"][0]),
+                float(obstacle["center"][1]),
+                float(obstacle["yaw"]),
+                float(obstacle["length"]),
+                float(obstacle["width"]),
+            ]
+            for obstacle in self.get_static_obstacles()
+        ]
+        # 静态障碍物沿用全局坐标，避免在仿真器与扩散适配器间重复转换。
+        static_obstacles_global = (
+            np.asarray(obstacle_rows, dtype=np.float32)
+            if obstacle_rows
+            else np.empty((0, 5), dtype=np.float32)
+        )
+
         return ScenarioFrame(
             scene_id=str(self.current_scene_id),
             step=self.current_step,
@@ -283,6 +300,7 @@ class Simulator:
             lanes_global=np.asarray(self.scenario_dict['lanes'], dtype=np.float32).copy(),
             route_global=np.asarray(self.scenario_dict['route'], dtype=np.float32).copy(),
             ego_state_global=np.asarray(self.ego_state, dtype=np.float32).copy(),
+            static_obstacles_global=static_obstacles_global,
         )
 
     def prepare_background_traffic(self):

@@ -381,6 +381,66 @@ def test_adapter_contract_and_global_round_trip():
     np.testing.assert_allclose(joint.yaws_global[:, 0, 0], [0.0, np.pi / 2], atol=1e-5)
 
 
+def test_static_obstacle_is_rasterized_and_forwarded_to_safe_sim():
+    frame = _frame()
+    frame = ScenarioFrame(
+        **{**frame.__dict__, "static_obstacles_global": np.array(
+            [[12.0, 5.0, 0.0, 2.0, 1.0]], dtype=np.float32
+        )}
+    )
+    adapter = SafeSimBatchAdapter(
+        history_frames=4, max_neighbors=2, raster_size=64, pixel_size=0.5
+    )
+    batch = adapter.build(frame)
+
+    # 对第一辆车而言，障碍物位于局部坐标 (2, 0)，应占据所有历史动态通道。
+    pixel = adapter._to_pixels(np.array([2.0, 0.0], dtype=np.float32))
+    assert torch.all(batch.data["image"][0, :4, pixel[1], pixel[0]] == -1.0)
+    assert tuple(batch.data["static_obstacles_world"].shape) == (2, 1, 5)
+    assert torch.all(batch.data["static_obstacle_mask"])
+    torch.testing.assert_close(
+        batch.data["static_obstacles_world"][0, 0],
+        torch.tensor([12.0, 5.0, 0.0, 2.0, 1.0]),
+    )
+
+
+def test_empty_static_obstacles_preserve_adapter_raster_output():
+    frame = _frame()
+    adapter = SafeSimBatchAdapter(
+        history_frames=4, max_neighbors=2, raster_size=64, pixel_size=0.5
+    )
+    first = adapter.build(frame)
+    second = adapter.build(frame)
+
+    torch.testing.assert_close(first.data["image"], second.data["image"])
+    assert tuple(first.data["static_obstacles_world"].shape) == (2, 0, 5)
+    assert tuple(first.data["static_obstacle_mask"].shape) == (2, 0)
+
+
+def test_static_obstacle_collision_penalty_rejects_crossing_trajectory():
+    calculator = ScenarioGuidanceCalculators["scenario_collision"](
+        loss_timesteps=2,
+        max_speed=1000.0,
+        max_acceleration=10000.0,
+        max_jerk=100000.0,
+        max_step_distance=100.0,
+    )
+    params = _scenario_collision_params(1, [0.0], attack_age=0)
+    params["scenario_ego_state"][:, 0] = 1000.0
+    params["static_obstacles_world"] = torch.tensor(
+        [[[0.0, 0.0, 0.0, 2.0, 2.0]]], dtype=torch.float32
+    )
+    params["static_obstacle_mask"] = torch.tensor([[True]])
+    crossing = torch.zeros((1, 2, 4), dtype=torch.float32)
+    bypass = torch.zeros((1, 2, 4), dtype=torch.float32)
+    bypass[..., 0] = 20.0
+
+    crossing_loss = calculator.calculate_loss(crossing[..., :2], crossing, params)
+    bypass_loss = calculator.calculate_loss(bypass[..., :2], bypass, params)
+
+    assert crossing_loss.sum() > bypass_loss.sum() + 100.0
+
+
 def test_simulator_consumes_only_first_joint_step():
     sim = Simulator.__new__(Simulator)
     sim.t = 3

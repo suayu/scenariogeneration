@@ -244,6 +244,14 @@ class RasterizedDiffusionModel(nn.Module):
             guidance_data["scenario_curr_acceleration_world"] = data_batch[
                 "scenario_curr_acceleration_world"
             ]
+        # 静态障碍物为可选条件，原始 Safe-Sim 数据批次不包含时保持旧路径。
+        if "static_obstacles_world" in data_batch:
+            guidance_data["static_obstacles_world"] = data_batch[
+                "static_obstacles_world"
+            ]
+            guidance_data["static_obstacle_mask"] = data_batch[
+                "static_obstacle_mask"
+            ]
 
         # Adjust shapes for batch processing
         self._adjust_batch_shapes(guidance_data, batch_size)
@@ -257,7 +265,8 @@ class RasterizedDiffusionModel(nn.Module):
             guidance_data (Dict): Data to be adjusted
             batch_size (int): Base batch size
         """
-        keys_to_adjust = ["centerline", "lane_avail","world_from_agent","yaw", "raster_from_agent","dis_map"]
+        keys_to_adjust = ["centerline", "lane_avail", "world_from_agent", "yaw", "raster_from_agent", "dis_map", "static_obstacles_world", "static_obstacle_mask"]
+        keys_to_adjust = [key for key in keys_to_adjust if key in guidance_data]
         
         for key in keys_to_adjust:
             guidance_data[key] = enlarge_batch_samples(
