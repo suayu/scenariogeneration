@@ -480,9 +480,9 @@ def render_state(
                 zorder=zorder+1
             )
 
-    # 静态障碍物使用与碰撞体一致的长宽和朝向，以棕色多边形显示。
-    obstacle_face_color = '#8B5A2B'
-    obstacle_edge_color = '#4A2C17'
+    # 静态障碍物使用高饱和粉色和加粗描边，确保在道路与轨迹上方清晰可见。
+    obstacle_face_color = '#FF4FA3'
+    obstacle_edge_color = '#97004E'
     for obstacle in static_obstacles or []:
         center = np.asarray(obstacle['center'], dtype=float)
         yaw = float(obstacle['yaw'])
@@ -501,8 +501,8 @@ def render_state(
             closed=True,
             facecolor=obstacle_face_color,
             edgecolor=obstacle_edge_color,
-            linewidth=1.2,
-            alpha=0.95,
+            linewidth=2.4,
+            alpha=0.98,
             # 静态障碍物始终覆盖道路、车辆和轨迹，便于识别最终碰撞几何。
             zorder=30,
         )
