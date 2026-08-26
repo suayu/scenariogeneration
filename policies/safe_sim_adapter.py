@@ -122,8 +122,10 @@ class SafeSimBatchAdapter:
         has_lane = bool(np.nanmin(distances[lane_index]) <= 5.0)
         return centerline.astype(np.float32), has_lane, initial_heading
 
-    def _rasterize(self, frame, controlled_ids, transforms):
+    def _rasterize(self, frame, controlled_ids, transforms, context_agent_ids=None):
         batch_size = len(controlled_ids)
+        if context_agent_ids is None:
+            context_agent_ids = controlled_ids
         image = np.zeros(
             (batch_size, self.history_frames + 3, self.raster_size, self.raster_size),
             dtype=np.float32,
@@ -146,7 +148,7 @@ class SafeSimBatchAdapter:
             )
 
             for hist_idx in range(self.history_frames):
-                for other_id in controlled_ids:
+                for other_id in context_agent_ids:
                     if not frame.history_mask[other_id, hist_idx]:
                         continue
                     local_point = _transform_points(frame.history_global[other_id, hist_idx, :2], transform)
@@ -166,7 +168,7 @@ class SafeSimBatchAdapter:
             padded_centerlines[row, : len(centerline)] = centerline
         return image, padded_centerlines, np.asarray(has_lanes), np.asarray(initial_headings, dtype=np.float32)
 
-    def build(self, frame):
+    def build(self, frame, controlled_agent_ids=None):
         if not isinstance(frame, ScenarioFrame):
             raise TypeError("frame must be a ScenarioFrame")
         if frame.history_global.shape[1] != self.history_frames:
@@ -174,7 +176,15 @@ class SafeSimBatchAdapter:
                 f"frame history has {frame.history_global.shape[1]} frames; expected {self.history_frames}"
             )
 
-        controlled_ids = frame.agent_ids[frame.active_mask].astype(np.int64, copy=False)
+        active_ids = frame.agent_ids[frame.active_mask].astype(np.int64, copy=False)
+        if controlled_agent_ids is None:
+            controlled_ids = active_ids
+        else:
+            controlled_ids = np.asarray(controlled_agent_ids, dtype=np.int64)
+            if len(np.unique(controlled_ids)) != len(controlled_ids):
+                raise ValueError('controlled_agent_ids must be unique')
+            if not set(controlled_ids.tolist()).issubset(set(active_ids.tolist())):
+                raise ValueError('controlled_agent_ids must be active participants')
         if len(controlled_ids) == 0:
             return SafeSimBatch(
                 data={},
@@ -201,7 +211,7 @@ class SafeSimBatchAdapter:
                 focal_yaw,
                 frame.dt,
             )
-            other_ids = controlled_ids[controlled_ids != agent_id]
+            other_ids = active_ids[active_ids != agent_id]
             if len(other_ids):
                 distances = np.linalg.norm(
                     frame.states_global[other_ids, :2] - frame.states_global[agent_id, :2], axis=-1
@@ -217,7 +227,7 @@ class SafeSimBatchAdapter:
                 )
 
         image, centerline, has_lane, initial_heading = self._rasterize(
-            frame, controlled_ids, agent_from_world
+            frame, controlled_ids, agent_from_world, context_agent_ids=active_ids
         )
         speeds = np.linalg.norm(controlled_states[:, 2:4], axis=-1).astype(np.float32)
         current_accelerations_world = np.zeros((batch_size, 2), dtype=np.float32)

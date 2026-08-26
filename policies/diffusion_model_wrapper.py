@@ -1,10 +1,14 @@
 """在 Scenario Dreamer 仿真器中使用 Safe-Sim 的生命周期封装。"""
 
 import sys
+import os
+import time
+from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Mapping
 from pathlib import Path
 
 import torch
+import numpy as np
 
 from policies.safe_sim_adapter import SafeSimBatchAdapter
 from policies.traffic_types import JointTrajectory, ScenarioFrame
@@ -15,6 +19,21 @@ def _move_to_device(value, device):
         return value.to(device)
     if isinstance(value, dict):
         return {key: _move_to_device(item, device) for key, item in value.items()}
+    return value
+
+
+def _slice_batch(value, indices, batch_size):
+    """仅沿参与者批次维切分推理输入，保留场景级标量不变。"""
+    if torch.is_tensor(value):
+        if value.ndim > 0 and value.shape[0] == batch_size:
+            return value.index_select(0, indices)
+        return value
+    if isinstance(value, dict):
+        return {key: _slice_batch(item, indices, batch_size) for key, item in value.items()}
+    if isinstance(value, list) and len(value) == batch_size:
+        return [value[index] for index in indices.tolist()]
+    if isinstance(value, tuple) and len(value) == batch_size:
+        return tuple(value[index] for index in indices.tolist())
     return value
 
 
@@ -41,6 +60,10 @@ class DiffusionModelWrapper:
         max_neighbors=20,
         num_samples=20,
         sample_step=1,
+        diffusion_agent_limit=0,
+        far_agent_mode="guided",
+        mixed_precision=False,
+        multi_gpu_devices=None,
         guidance_config=None,
         anchor_guidance_enabled=False,
         anchor_guidance_strength=0.2,
@@ -63,6 +86,14 @@ class DiffusionModelWrapper:
         self.prediction_horizon = int(prediction_horizon)
         self.num_samples = int(num_samples)
         self.sample_step = int(sample_step)
+        self.diffusion_agent_limit = int(diffusion_agent_limit)
+        self.far_agent_mode = str(far_agent_mode).lower()
+        self.mixed_precision = bool(mixed_precision)
+        if self.diffusion_agent_limit < 0:
+            raise ValueError("diffusion_agent_limit must be non-negative")
+        if self.far_agent_mode not in {"guided", "unguided_diffusion"}:
+            raise ValueError("far_agent_mode must be guided or unguided_diffusion")
+        self.parallel_devices = self._resolve_parallel_devices(multi_gpu_devices)
         self.guidance_config = _to_plain_value(guidance_config or {})
         legacy_anchor_enabled = bool(anchor_guidance_enabled)
         self.guidance_mode = str(
@@ -98,8 +129,22 @@ class DiffusionModelWrapper:
         self.active_guidance_functions = []
         self.guidance_enabled = False
         self.uses_anchor_guidance = False
+        # 性能诊断默认关闭；开启时才同步 CUDA 并记录分段耗时，不影响常规接口。
+        self.performance_diagnostics = os.environ.get("SAFE_SIM_PERF_DIAGNOSTICS") == "1"
+        self.performance_records = []
 
         self.policy, self.exp_config = self._load_policy()
+        # 多卡模式为每张卡加载持久副本；默认列表仅包含原有的单卡模型。
+        self.policy_replicas = [(self.device, self.policy)]
+        for replica_device in self.parallel_devices[1:]:
+            replica_policy, _ = self._load_policy(device=replica_device)
+            self.policy_replicas.append((replica_device, replica_policy))
+        for _, replica_policy in self.policy_replicas:
+            replica_policy.nets["policy"].diffusion.autocast_denoiser = self.mixed_precision
+        # 远车无引导路径只在显式启用且确有裁剪时加载，默认不增加显存或加载时间。
+        self.unguided_policy = None
+        if self.far_agent_mode == "unguided_diffusion" and self.diffusion_agent_limit > 0:
+            self.unguided_policy, _ = self._load_unguided_policy()
         checkpoint_history = int(self.exp_config.algo.history_num_frames) + 1
         checkpoint_horizon = int(self.exp_config.algo.horizon)
         self.step_time = float(self.exp_config.algo.step_time)
@@ -141,7 +186,25 @@ class DiffusionModelWrapper:
             if path.exists() and path_string not in sys.path:
                 sys.path.insert(0, path_string)
 
-    def _load_policy(self):
+    def _resolve_parallel_devices(self, configured_devices):
+        """解析可选多卡设备，空配置时严格保留既有单卡路径。"""
+        if configured_devices is None:
+            return [self.device]
+        requested = [str(item) for item in configured_devices]
+        if not requested:
+            return [self.device]
+        devices = [torch.device(item) for item in requested]
+        if any(device.type != "cuda" for device in devices):
+            raise ValueError("multi_gpu_devices must contain CUDA devices only")
+        if any(device.index is None or device.index >= torch.cuda.device_count() for device in devices):
+            raise ValueError("multi_gpu_devices contains an unavailable CUDA device")
+        if len(set(str(device) for device in devices)) != len(devices):
+            raise ValueError("multi_gpu_devices must not contain duplicates")
+        if self.device not in devices:
+            devices.insert(0, self.device)
+        return devices
+
+    def _load_policy(self, device=None):
         from tbsim.algos.algos import DiffusionTrafficModel
         from tbsim.configs.config import Dict
         from tbsim.configs.guidance_config import GuidanceConfig
@@ -201,13 +264,29 @@ class DiffusionModelWrapper:
 
         modality_shapes = batch_utils().get_modality_shapes(exp_config)
         self.modality_shapes = modality_shapes
+        load_device = self.device if device is None else torch.device(device)
         policy = DiffusionTrafficModel.load_from_checkpoint(
             str(self.checkpoint_path),
             algo_config=exp_config.algo,
             modality_shapes=modality_shapes,
-            map_location=self.device,
-        ).to(self.device).eval()
+            map_location=load_device,
+        ).to(load_device).eval()
         return policy, exp_config
+
+    def _load_unguided_policy(self, device=None):
+        """临时复用配置加载无引导副本，不改变主引导模型和默认路径。"""
+        original_mode = self.guidance_mode
+        original_functions = self.active_guidance_functions
+        original_guidance_enabled = self.guidance_enabled
+        original_anchor_enabled = self.uses_anchor_guidance
+        self.guidance_mode = "unguided"
+        try:
+            return self._load_policy(device=device)
+        finally:
+            self.guidance_mode = original_mode
+            self.active_guidance_functions = original_functions
+            self.guidance_enabled = original_guidance_enabled
+            self.uses_anchor_guidance = original_anchor_enabled
 
     def _resolve_guidance_profile(self):
         """将四种启动模式解析为 Safe-Sim 的损失列表、权重和参数。"""
@@ -280,7 +359,215 @@ class DiffusionModelWrapper:
         return int(safe_batch.row_to_agent_id[int(torch.argmin(distances))])
 
     def reset(self, scene_id):
+        """重置场景相关状态，并清空本场景的可选性能诊断记录。"""
         self.scene_id = str(scene_id)
+        self.performance_records.clear()
+
+    def _perf_start(self):
+        for device, _ in self.policy_replicas:
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+        return time.perf_counter()
+
+    def _perf_stop(self, start_time):
+        for device, _ in self.policy_replicas:
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+        return time.perf_counter() - start_time
+
+    def _select_diffusion_agent_ids(self, frame, attack_intent):
+        """优先保留攻击车和自车邻近车辆，其余车辆采用恒速回退轨迹。"""
+        active_ids = frame.agent_ids[frame.active_mask].astype("int64", copy=False)
+        limit = self.diffusion_agent_limit
+        if limit == 0 or limit >= len(active_ids):
+            return active_ids
+        if frame.ego_state_global is None:
+            return active_ids[:limit]
+        distances = ((
+            frame.states_global[active_ids, :2] - frame.ego_state_global[None, :2]
+        ) ** 2).sum(axis=-1)
+        priority = []
+        if attack_intent is not None:
+            target_id = int(attack_intent["target_id"])
+            if target_id in active_ids:
+                priority.append(target_id)
+        for index in distances.argsort().tolist():
+            agent_id = int(active_ids[index])
+            if agent_id not in priority:
+                priority.append(agent_id)
+            if len(priority) >= limit:
+                break
+        selected = set(priority[:limit])
+        # 保持稳定编号顺序，确保解码、可视化与联合筛选的行含义不变。
+        return active_ids[[agent_id in selected for agent_id in active_ids]]
+
+    def _merge_constant_velocity_agents(self, frame, joint, active_ids):
+        """补全未扩散车辆的恒速预测，维持仿真器的全参与者联合轨迹契约。"""
+        if np.array_equal(joint.agent_ids, active_ids):
+            joint.metadata["diffusion_agent_count"] = int(len(active_ids))
+            joint.metadata["constant_velocity_agent_count"] = 0
+            return joint
+        horizon = joint.positions_global.shape[1]
+        positions = np.zeros((len(active_ids), horizon, 2), dtype=np.float32)
+        velocities = np.zeros_like(positions)
+        yaws = np.zeros((len(active_ids), horizon, 1), dtype=np.float32)
+        valid_mask = np.ones((len(active_ids), horizon), dtype=bool)
+        selected_row = {int(agent_id): row for row, agent_id in enumerate(joint.agent_ids)}
+        time_offsets = (
+            np.arange(1, horizon + 1, dtype=np.float32) * float(frame.dt)
+        )
+        for row, agent_id in enumerate(active_ids):
+            source_row = selected_row.get(int(agent_id))
+            if source_row is not None:
+                positions[row] = joint.positions_global[source_row]
+                velocities[row] = joint.velocities_global[source_row]
+                yaws[row] = joint.yaws_global[source_row]
+                valid_mask[row] = joint.valid_mask[source_row]
+                continue
+            state = frame.states_global[agent_id]
+            velocity = state[2:4].astype(np.float32, copy=False)
+            positions[row] = state[None, :2] + time_offsets[:, None] * velocity[None, :]
+            velocities[row] = velocity[None, :]
+            yaws[row, :, 0] = float(state[4])
+        metadata = dict(joint.metadata)
+        metadata.update({
+            "diffusion_agent_count": int(len(joint.agent_ids)),
+            "constant_velocity_agent_count": int(len(active_ids) - len(joint.agent_ids)),
+        })
+        return JointTrajectory(
+            source_step=joint.source_step,
+            agent_ids=active_ids.copy(),
+            positions_global=positions,
+            yaws_global=yaws,
+            velocities_global=velocities,
+            valid_mask=valid_mask,
+            metadata=metadata,
+        )
+
+    def _combine_joint_trajectories(self, frame, joints, active_ids):
+        """按稳定车辆编号合并引导与无引导预测，保持原有全参与者轨迹接口。"""
+        if not joints:
+            raise ValueError("at least one joint trajectory is required")
+        horizon = joints[0].positions_global.shape[1]
+        positions = np.zeros((len(active_ids), horizon, 2), dtype=np.float32)
+        velocities = np.zeros_like(positions)
+        yaws = np.zeros((len(active_ids), horizon, 1), dtype=np.float32)
+        valid_mask = np.zeros((len(active_ids), horizon), dtype=bool)
+        rows = {int(agent_id): index for index, agent_id in enumerate(active_ids)}
+        for joint in joints:
+            if joint.positions_global.shape[1] != horizon:
+                raise ValueError("joint trajectories must share a prediction horizon")
+            for source_row, agent_id in enumerate(joint.agent_ids):
+                target_row = rows.get(int(agent_id))
+                if target_row is None:
+                    raise ValueError("joint trajectory contains an inactive participant")
+                positions[target_row] = joint.positions_global[source_row]
+                velocities[target_row] = joint.velocities_global[source_row]
+                yaws[target_row] = joint.yaws_global[source_row]
+                valid_mask[target_row] = joint.valid_mask[source_row]
+        if not valid_mask.all():
+            raise RuntimeError("guided and unguided trajectories did not cover every active participant")
+        metadata = dict(joints[0].metadata)
+        metadata.update({
+            "diffusion_agent_count": int(len(joints[0].agent_ids)),
+            "unguided_diffusion_agent_count": int(sum(len(joint.agent_ids) for joint in joints[1:])),
+            "constant_velocity_agent_count": 0,
+        })
+        return JointTrajectory(
+            source_step=frame.step,
+            agent_ids=active_ids.copy(),
+            positions_global=positions,
+            yaws_global=yaws,
+            velocities_global=velocities,
+            valid_mask=valid_mask,
+            metadata=metadata,
+        )
+
+    def _configure_anchor_loss(self, policy_net, anchor_tensors, anchor_active, device):
+        """在每个模型副本上设置本分片的 LLM 锚点，并返回待清理的损失对象。"""
+        if not self.uses_anchor_guidance:
+            return None
+        anchor_loss = self._find_loss_calculator(policy_net.Loss_Calculater, "llm_anchor")
+        if anchor_loss is None:
+            raise RuntimeError("llm_anchor guidance is configured but its calculator is missing")
+        if anchor_active:
+            tensors = _move_to_device(anchor_tensors, device)
+            anchor_loss.set_anchor_targets(
+                tensors["llm_anchor_positions_local"],
+                tensors["llm_anchor_mask"],
+                self.num_samples,
+            )
+        else:
+            anchor_loss.clear_anchor_targets()
+        return anchor_loss
+
+    def _sample_policy(self, policy, device, model_batch, anchor_tensors, anchor_active):
+        """在指定 GPU 上执行一块车辆批次，允许 FP16 作为可选性能实验。"""
+        local_batch = _move_to_device(model_batch, device)
+        policy_net = policy.nets["policy"]
+        anchor_loss = self._configure_anchor_loss(
+            policy_net, anchor_tensors, anchor_active, device
+        )
+        inference_context = torch.enable_grad() if self.guidance_enabled else torch.inference_mode()
+        try:
+            with inference_context:
+                return policy.get_action(local_batch, sample=True)
+        finally:
+            if anchor_loss is not None:
+                anchor_loss.clear_anchor_targets()
+
+    @staticmethod
+    def _sample_unguided_policy(policy, device, model_batch):
+        """远车只执行无梯度扩散采样，不计算任何对抗或锚点损失。"""
+        local_batch = _move_to_device(model_batch, device)
+        with torch.inference_mode():
+            return policy.get_action(local_batch, sample=True)
+
+    def _parallel_get_action(self, model_batch, anchor_tensors, anchor_active):
+        """按车辆维分片到多张 GPU；最终仍由主卡作全局候选样本筛选。"""
+        batch_size = int(model_batch["image"].shape[0])
+        shard_count = min(len(self.policy_replicas), batch_size)
+        indices = torch.arange(batch_size, dtype=torch.long)
+        shards = [chunk for chunk in torch.tensor_split(indices, shard_count) if len(chunk)]
+
+        def run_shard(replica, shard_indices):
+            device, policy = replica
+            shard_batch = _slice_batch(model_batch, shard_indices, batch_size)
+            shard_anchors = (
+                _slice_batch(anchor_tensors, shard_indices, batch_size)
+                if anchor_tensors is not None
+                else None
+            )
+            return self._sample_policy(
+                policy, device, shard_batch, shard_anchors, anchor_active
+            )
+
+        with ThreadPoolExecutor(max_workers=shard_count) as executor:
+            futures = [
+                executor.submit(run_shard, replica, shard)
+                for replica, shard in zip(self.policy_replicas, shards)
+            ]
+            results = [future.result() for future in futures]
+        actions, infos = zip(*results)
+        positions = torch.cat(
+            [action.positions.to(self.device) for action in actions], dim=0
+        )
+        yaws = torch.cat([action.yaws.to(self.device) for action in actions], dim=0)
+        merged_action = type(actions[0])(positions=positions, yaws=yaws)
+        sample_positions = []
+        sample_yaws = []
+        for info in infos:
+            samples = info.get("action_samples", {})
+            if "positions" not in samples or "yaws" not in samples:
+                return merged_action, {}
+            sample_positions.append(samples["positions"].to(self.device))
+            sample_yaws.append(samples["yaws"].to(self.device))
+        return merged_action, {
+            "action_samples": {
+                "positions": torch.cat(sample_positions, dim=0),
+                "yaws": torch.cat(sample_yaws, dim=0),
+            }
+        }
 
     def _select_joint_guided_action(self, policy_net, model_batch, action, info):
         """使用全场联合损失为所有交通参与者选择同一个扩散样本。"""
@@ -336,9 +623,20 @@ class DiffusionModelWrapper:
                 f"Scenario Dreamer dt={frame.dt} does not match Safe-Sim checkpoint step_time={self.step_time}"
             )
 
-        safe_batch = self.adapter.build(frame)
+        perf = {} if self.performance_diagnostics else None
+        if perf is not None:
+            if self.device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(self.device)
+            input_start = self._perf_start()
+        active_ids = frame.agent_ids[frame.active_mask].astype(np.int64, copy=False)
+        controlled_ids = self._select_diffusion_agent_ids(frame, attack_intent)
+        safe_batch = self.adapter.build(frame, controlled_agent_ids=controlled_ids)
         if len(safe_batch.row_to_agent_id) == 0:
             return JointTrajectory.empty(frame.step)
+        far_ids = active_ids[~np.isin(active_ids, controlled_ids)]
+        far_safe_batch = None
+        if self.far_agent_mode == "unguided_diffusion" and len(far_ids):
+            far_safe_batch = self.adapter.build(frame, controlled_agent_ids=far_ids)
 
         anchor_metadata = {"active": False, "target_id": None, "valid_steps": 0}
         if self.uses_anchor_guidance:
@@ -369,48 +667,76 @@ class DiffusionModelWrapper:
             attack_age_frames = int(frame.step - source_step)
         # 运行时攻击阶段仅通过可选张量传入，不改变无攻击或无引导采样路径。
         model_batch["guidance_attack_active"] = attack_active
+        # LLM 指定的攻击车允许离开道路；其他交通参与者仍受 route 损失约束。
+        model_batch["guidance_route_exempt_mask"] = attack_active
         model_batch["guidance_attack_age_frames"] = torch.full(
             (len(safe_batch.row_to_agent_id),),
             attack_age_frames,
             dtype=torch.int64,
         )
-        model_batch = _move_to_device(model_batch, self.device)
+        model_batch_cpu = model_batch
+        model_batch = _move_to_device(model_batch_cpu, self.device)
         expected_image_shape = (len(safe_batch.row_to_agent_id), *self.modality_shapes["image"])
         if tuple(model_batch["image"].shape) != expected_image_shape:
             raise ValueError(
                 f"Safe-Sim image batch must be {expected_image_shape}, got {tuple(model_batch['image'].shape)}"
             )
-        inference_context = torch.enable_grad() if self.guidance_enabled else torch.inference_mode()
+        if perf is not None:
+            perf["input_preparation_s"] = self._perf_stop(input_start)
         policy_net = self.policy.nets["policy"]
-        anchor_loss = None
-        if self.uses_anchor_guidance:
-            anchor_loss = self._find_loss_calculator(policy_net.Loss_Calculater, "llm_anchor")
-            if anchor_loss is None:
-                raise RuntimeError("llm_anchor guidance is configured but its calculator is missing")
-            if anchor_metadata["active"]:
-                anchor_tensors = _move_to_device(anchor_tensors, self.device)
-                anchor_loss.set_anchor_targets(
-                    anchor_tensors["llm_anchor_positions_local"],
-                    anchor_tensors["llm_anchor_mask"],
-                    self.num_samples,
-                )
-            else:
-                anchor_loss.clear_anchor_targets()
-        try:
-            with inference_context:
-                action, info = self.policy.get_action(model_batch, sample=True)
-                action, joint_sample_index = self._select_joint_guided_action(
-                    policy_net,
-                    model_batch,
-                    action,
-                    info,
-                )
-        finally:
-            if anchor_loss is not None:
-                anchor_loss.clear_anchor_targets()
+        if perf is not None:
+            sampling_start = self._perf_start()
+        if len(self.policy_replicas) > 1 and len(safe_batch.row_to_agent_id) > 1:
+            action, info = self._parallel_get_action(
+                model_batch_cpu,
+                anchor_tensors if self.uses_anchor_guidance else None,
+                anchor_metadata["active"],
+            )
+        else:
+            action, info = self._sample_policy(
+                self.policy,
+                self.device,
+                model_batch_cpu,
+                anchor_tensors if self.uses_anchor_guidance else None,
+                anchor_metadata["active"],
+            )
+        far_action = None
+        if far_safe_batch is not None:
+            far_action, _ = self._sample_unguided_policy(
+                self.unguided_policy,
+                self.device,
+                dict(far_safe_batch.data),
+            )
+        if perf is not None:
+            perf["model_sampling_s"] = self._perf_stop(sampling_start)
+            selection_start = self._perf_start()
+        action, joint_sample_index = self._select_joint_guided_action(
+            policy_net,
+            model_batch,
+            action,
+            info,
+        )
+        if perf is not None:
+            perf["joint_selection_s"] = self._perf_stop(selection_start)
+        if perf is not None:
+            decode_start = self._perf_start()
         positions_local = action.positions.detach().cpu().numpy()
         yaws_local = action.yaws.detach().cpu().numpy()
         joint = self.adapter.decode(frame, safe_batch, positions_local, yaws_local)
+        if far_safe_batch is not None:
+            far_joint = self.adapter.decode(
+                frame,
+                far_safe_batch,
+                far_action.positions.detach().cpu().numpy(),
+                far_action.yaws.detach().cpu().numpy(),
+            )
+            joint = self._combine_joint_trajectories(
+                frame, [joint, far_joint], active_ids
+            )
+        else:
+            joint = self._merge_constant_velocity_agents(frame, joint, active_ids)
+        if perf is not None:
+            perf["decode_s"] = self._perf_stop(decode_start)
         joint.metadata.update(
             {
                 "checkpoint": self.checkpoint_path.name,
@@ -429,8 +755,15 @@ class DiffusionModelWrapper:
                 "anchor_guidance_target_id": anchor_metadata["target_id"],
                 "anchor_guidance_valid_steps": anchor_metadata["valid_steps"],
                 "anchor_guidance_strength": self.anchor_guidance_strength,
+                "mixed_precision": self.mixed_precision,
+                "multi_gpu_devices": [str(device) for device, _ in self.policy_replicas],
+                "far_agent_mode": self.far_agent_mode,
             }
         )
+        if perf is not None:
+            perf["peak_memory_bytes"] = torch.cuda.max_memory_allocated(self.device) if self.device.type == "cuda" else 0
+            self.performance_records.append(perf)
+            print("[safe-sim-perf] " + " ".join(f"{key}={value:.6f}" for key, value in perf.items()))
         return joint
 
 

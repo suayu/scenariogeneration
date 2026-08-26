@@ -14,6 +14,23 @@ import os
 from scenario_generator import AdversarialScenarioGenerator
 from policies.risk_metrics import compute_scenario_danger_score
 
+
+def enable_llm_joint_guidance_for_natural_language(cfg, user_instruction):
+    """在存在自然语言攻击需求时启用锚点联合引导。
+
+    仅替换默认的 unguided 模式，保留用户显式指定的 default、manual 等实验配置。
+    """
+    has_instruction = any(str(item).strip() for item in (user_instruction or []))
+    if not has_instruction:
+        return False
+
+    guidance = cfg.sim.traffic_model.guidance
+    if str(guidance.mode).lower() != "unguided":
+        return False
+
+    guidance.mode = "llm_joint"
+    return True
+
 class PolicyEvaluator:
     """ Evaluate a given policy in a simulation environment over multiple scenarios."""
     def __init__(self, cfg, policy, env, user_instruction):
@@ -153,6 +170,9 @@ def main(cfg):
     else:
         print(f"[Error] {attack_request_file} not found. No attack instructions loaded.")
         user_instruction = []
+
+    if enable_llm_joint_guidance_for_natural_language(cfg, user_instruction):
+        print("[自然语言攻击] 已自动启用 sim.traffic_model.guidance.mode=llm_joint。")
 
     # initialize simulation environments
     # cfg.sim contains all simulation related configurations

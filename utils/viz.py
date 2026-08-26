@@ -480,7 +480,7 @@ def render_state(
                 zorder=zorder+1
             )
 
-    # 静态障碍物使用与碰撞体一致的长宽和朝向，并放在所有动态元素之上。
+    # 静态障碍物使用与碰撞体一致的长宽和朝向，以棕色多边形显示。
     obstacle_face_color = '#8B5A2B'
     obstacle_edge_color = '#4A2C17'
     for obstacle in static_obstacles or []:
@@ -503,6 +503,7 @@ def render_state(
             edgecolor=obstacle_edge_color,
             linewidth=1.2,
             alpha=0.95,
+            # 静态障碍物始终覆盖道路、车辆和轨迹，便于识别最终碰撞几何。
             zorder=30,
         )
         ax.add_patch(polygon)
@@ -630,31 +631,20 @@ def render_state(
             zorder=ego_zord, 
             s=8
         )
-    # LLM 锚点与 Safe-Sim 细化轨迹分别受独立参数控制，开关不影响仿真状态。
+    # LLM 锚点与 Safe-Sim 细化轨迹分别受独立开关控制，不影响仿真状态。
     if show_llm_anchors and anchors is not None and len(anchors) > 0:
         anchors = np.asarray(anchors)
         ax.scatter(
-            anchors[:, 0],
-            anchors[:, 1],
-            color='blue',
-            label='LLM Anchors',
-            zorder=12,
-            s=20,
+            anchors[:, 0], anchors[:, 1], color='blue', label='LLM Anchors',
+            zorder=31, s=24,
         )
-
-    if (
-        show_diffusion_trajectory
-        and diffusion_trajectory is not None
-        and len(diffusion_trajectory) > 0
-    ):
+        ax.plot(anchors[:, 0], anchors[:, 1], color='blue', linestyle='--',
+                linewidth=1.2, zorder=30)
+    if show_diffusion_trajectory and diffusion_trajectory is not None and len(diffusion_trajectory) > 0:
         diffusion_trajectory = np.asarray(diffusion_trajectory)
         ax.plot(
-            diffusion_trajectory[:, 0],
-            diffusion_trajectory[:, 1],
-            color='red',
-            label='Safe-Sim Attack Trajectory',
-            zorder=11,
-            linewidth=1.5,
+            diffusion_trajectory[:, 0], diffusion_trajectory[:, 1], color='red',
+            label='Safe-Sim Attack Trajectory', zorder=29, linewidth=1.6,
         )
 
     plt.tight_layout()
@@ -678,8 +668,8 @@ def generate_video(name, output_dir, delete_images=False):
     images.sort()  # Sort by filename
 
     # Create a video clip from the image sequence
-    # clip = ImageSequenceClip(images, fps=5)
-    clip = ImageSequenceClip(images, fps=10)
+    clip = ImageSequenceClip(images, fps=5)
+    # clip = ImageSequenceClip(images, fps=10)
     
     # Write the video file
     clip.write_videofile(f"{image_folder}/{name}.mp4", codec='libx264')

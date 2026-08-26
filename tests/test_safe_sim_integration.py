@@ -7,7 +7,10 @@ import torch
 from policies.llm_adversarial_planner import LLMAdversarialPlanner
 from policies.llm_anchor_guidance import register_llm_anchor_guidance
 from policies.diffusion_model_wrapper import DiffusionModelWrapper
-from policies.scenario_guidance import register_scenario_guidance
+from policies.scenario_guidance import (
+    register_scenario_guidance,
+    resolve_attack_contact_schedule,
+)
 from policies.obstacle_wrapper import CarlaObstacleBackend, ObstacleWrapper, ScenarioDreamerObstacleBackend
 from policies.obstacles import ObstacleCatalog, StaticObstacle
 from policies.safe_sim_adapter import SafeSimBatchAdapter
@@ -109,6 +112,190 @@ def test_scenario_ttc_targets_only_selected_background_agent():
     assert torch.isfinite(loss).all()
 
 
+def _scenario_collision_params(batch_size, attack_mask, attack_age):
+    transforms = torch.eye(3).repeat(batch_size, 1, 1)
+    return {
+        "batch_size": batch_size,
+        "num_samples": 1,
+        "world_from_agent": transforms,
+        "scenario_ego_state": torch.tensor(
+            [[0.0, 0.0, 0.0, 0.0, 0.0, 4.0, 2.0, 1.0]]
+        ).repeat(batch_size, 1),
+        "ego_extents": torch.tensor([[4.0, 2.0]]).repeat(batch_size, 1),
+        "curr_speed": torch.zeros(batch_size),
+        "yaw": torch.zeros(batch_size),
+        "guidance_attack_active": torch.tensor(attack_mask, dtype=torch.float32),
+        "guidance_attack_age_frames": torch.full((batch_size,), attack_age),
+        "dt": 0.1,
+    }
+
+
+def test_attack_contact_schedule_has_protection_relaxation_and_contact_phases():
+    protection = resolve_attack_contact_schedule(0, 2, 6, 2)
+    relaxation_start = resolve_attack_contact_schedule(2, 2, 6, 2)
+    relaxation_end = resolve_attack_contact_schedule(7, 2, 6, 2)
+    contact_start = resolve_attack_contact_schedule(8, 2, 6, 2)
+    contact_now = resolve_attack_contact_schedule(9, 2, 6, 2)
+
+    assert protection == {
+        "phase": "protection",
+        "avoidance_weight": 1.0,
+        "contact_weight": 0.0,
+        "contact_step": None,
+    }
+    assert relaxation_start["phase"] == "relaxation"
+    assert relaxation_start["avoidance_weight"] == 5.0 / 6.0
+    assert relaxation_end["avoidance_weight"] == 0.0
+    assert contact_start["contact_weight"] == 0.5
+    assert contact_start["contact_step"] == 1
+    assert contact_now["contact_weight"] == 1.0
+    assert contact_now["contact_step"] == 0
+
+
+def test_non_attacker_keeps_ego_avoidance_during_late_contact_phase():
+    calculator = ScenarioGuidanceCalculators["scenario_collision"](
+        loss_timesteps=2,
+        max_speed=1000.0,
+        max_acceleration=10000.0,
+        max_jerk=100000.0,
+        max_step_distance=100.0,
+    )
+    state = torch.zeros((2, 2, 4), dtype=torch.float32)
+    state[0, :, 0] = 20.0
+    params = _scenario_collision_params(2, [1.0, 0.0], attack_age=9)
+
+    loss = calculator.calculate_loss(state[..., :2], state, params)
+
+    # 非攻击车辆 1 与自车重叠，末段也必须保留显著防碰撞损失。
+    assert torch.all(loss[1] > 1.0)
+
+
+def test_background_pair_collision_avoidance_is_preserved_for_attacker():
+    calculator = ScenarioGuidanceCalculators["scenario_collision"](
+        loss_timesteps=2,
+        max_speed=1000.0,
+        max_acceleration=10000.0,
+        max_jerk=100000.0,
+        max_step_distance=100.0,
+    )
+    state = torch.zeros((2, 2, 4), dtype=torch.float32)
+    state[:, :, 0] = 20.0
+    params = _scenario_collision_params(2, [1.0, 0.0], attack_age=9)
+
+    loss = calculator.calculate_loss(state[..., :2], state, params)
+
+    # 两辆背景车在远离自车处重叠；攻击者身份不能关闭背景车之间的约束。
+    assert torch.all(loss > 100.0)
+
+
+def test_late_contact_prefers_shallow_contact_and_rejects_deep_penetration():
+    calculator = ScenarioGuidanceCalculators["scenario_collision"](
+        loss_timesteps=1,
+        max_speed=1000.0,
+        max_acceleration=10000.0,
+        max_jerk=100000.0,
+        max_step_distance=100.0,
+    )
+    params = _scenario_collision_params(1, [1.0], attack_age=9)
+    desired_distance = float(np.sqrt(5.0) * 2.0 - 0.05)
+
+    shallow = torch.zeros((1, 1, 4), dtype=torch.float32)
+    shallow[..., 0] = desired_distance
+    far = shallow.clone()
+    far[..., 0] += 3.0
+    deep = shallow.clone()
+    deep[..., 0] = 0.0
+
+    shallow_loss = calculator.calculate_loss(shallow[..., :2], shallow, params)
+    far_loss = calculator.calculate_loss(far[..., :2], far, params)
+    deep_loss = calculator.calculate_loss(deep[..., :2], deep, params)
+
+    assert shallow_loss.item() < far_loss.item()
+    assert shallow_loss.item() < deep_loss.item()
+
+
+def test_kinematics_loss_penalizes_teleportation_in_every_attack_phase():
+    calculator = ScenarioGuidanceCalculators["scenario_collision"](
+        loss_timesteps=2,
+        max_speed=20.0,
+        max_acceleration=6.0,
+        max_jerk=12.0,
+        max_step_distance=2.0,
+    )
+    params = _scenario_collision_params(1, [1.0], attack_age=9)
+    params["scenario_ego_state"][:, 0] = 1000.0
+    params["curr_speed"][:] = 1.0
+    normal = torch.zeros((1, 2, 4), dtype=torch.float32)
+    normal[0, :, 0] = torch.tensor([0.1, 0.2])
+    teleport = torch.zeros((1, 2, 4), dtype=torch.float32)
+    teleport[0, :, 0] = torch.tensor([5.0, 10.0])
+
+    normal_loss = calculator.calculate_loss(normal[..., :2], normal, params)
+    teleport_loss = calculator.calculate_loss(teleport[..., :2], teleport, params)
+
+    assert teleport_loss.sum() > normal_loss.sum() + 100.0
+
+
+def test_collision_guidance_supports_multiple_diffusion_samples():
+    calculator = ScenarioGuidanceCalculators["scenario_collision"](
+        loss_timesteps=4,
+    )
+    batch_size = 2
+    num_samples = 3
+    state = torch.zeros(
+        (batch_size * num_samples, 4, 4), dtype=torch.float32, requires_grad=True
+    )
+    transforms = torch.eye(3).repeat(batch_size * num_samples, 1, 1)
+    transforms[:num_samples, 0, 2] = 10.0
+    transforms[num_samples:, 0, 2] = 20.0
+    params = _scenario_collision_params(batch_size, [1.0, 0.0], attack_age=0)
+    params["num_samples"] = num_samples
+    params["world_from_agent"] = transforms
+    params["yaw"] = torch.zeros(batch_size * num_samples)
+
+    loss = calculator.calculate_loss(state[..., :2], state, params)
+
+    assert loss.shape == (batch_size * num_samples, 4)
+    assert torch.isfinite(loss).all()
+    loss.sum().backward()
+    assert torch.isfinite(state.grad).all()
+
+
+def test_wrapper_selects_one_shared_sample_from_joint_guidance_loss():
+    class FakeLossCalculator:
+        def calculate_loss(self, action, state, guidance_data):
+            return state[..., 0].square()
+
+    class FakePolicyNet:
+        Loss_Calculater = FakeLossCalculator()
+
+        @staticmethod
+        def _prepare_guidance_data(model_batch):
+            return {"batch_size": 2}
+
+    wrapper = DiffusionModelWrapper.__new__(DiffusionModelWrapper)
+    wrapper.guidance_enabled = True
+    positions = torch.zeros((2, 3, 1, 2))
+    positions[:, 0, 0, 0] = torch.tensor([0.0, 10.0])
+    positions[:, 1, 0, 0] = torch.tensor([2.0, 2.0])
+    positions[:, 2, 0, 0] = torch.tensor([5.0, 5.0])
+    yaws = torch.zeros((2, 3, 1, 1))
+    action = SimpleNamespace(
+        positions=torch.zeros((2, 1, 2)),
+        yaws=torch.zeros((2, 1, 1)),
+    )
+
+    selected, selected_index = wrapper._select_joint_guided_action(
+        FakePolicyNet(),
+        {},
+        action,
+        {"action_samples": {"positions": positions, "yaws": yaws}},
+    )
+
+    assert selected_index == 1
+    torch.testing.assert_close(selected.positions, positions[:, 1])
+
+
 def test_llm_joint_without_attack_does_not_create_fallback_adversarial_target():
     frame = _frame()
     adapter = SafeSimBatchAdapter(
@@ -176,6 +363,7 @@ def test_adapter_contract_and_global_round_trip():
     assert batch.row_to_agent_id.tolist() == [0, 1]
     assert tuple(batch.data["image"].shape) == (2, 7, 64, 64)
     assert tuple(batch.data["agent_hist"].shape) == (2, 4, 9)
+    assert tuple(batch.data["scenario_curr_acceleration_world"].shape) == (2, 2)
     assert tuple(batch.data["neigh_hist"].shape) == (2, 2, 4, 9)
     assert batch.data["image"].isfinite().all()
 
@@ -352,6 +540,23 @@ def test_llm_limit_disables_attack_without_stopping_simulation():
 
     assert generator.step(env=object(), current_t=0) is True
     assert generator._attacks_enabled is False
+
+
+def test_attack_intent_is_cleared_exactly_at_ten_frame_boundary():
+    generator = AdversarialScenarioGenerator(None, [], llm_planner=object())
+    generator.last_attack_frame = 0
+    generator.last_query_frame = 10
+    env = SimpleNamespace(attack_intent={"target_id": 1})
+
+    def clear_attack_intent():
+        env.attack_intent = None
+
+    env.clear_attack_intent = clear_attack_intent
+
+    assert generator.step(env=env, current_t=9) is True
+    assert env.attack_intent is not None
+    assert generator.step(env=env, current_t=10) is True
+    assert env.attack_intent is None
 
 
 def test_llm_json_plan_is_parsed_with_injected_client():

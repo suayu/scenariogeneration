@@ -1,4 +1,6 @@
 # scenario_generator.py
+import random
+
 import numpy as np
 from policies.llm_adversarial_planner import LLMAdversarialPlanner
 from policies.risk_metrics import AdversarialRiskMetrics
@@ -17,7 +19,8 @@ class AdversarialScenarioGenerator:
         # 大模型调用次数
         self._llm_call_times = 0
         self._max_call_times = 30  # 每个场景最多调用大模型次数
-        self._ignore_call_times = 2  # 每个场景忽略調用大模型次数
+        # 首帧即允许规划；短场景不能在预热阶段结束前错过自然语言攻击机会。
+        self._ignore_call_times = 0
         self._attacks_enabled = bool(getattr(self.llm_planner, "available", True))
         # LLM 服务连续失败达到阈值后，仅停用当前场景的高级攻击规划。
         self._max_consecutive_llm_failures = self._read_max_consecutive_llm_failures()
@@ -37,6 +40,7 @@ class AdversarialScenarioGenerator:
 
         # 用户指令
         self.user_instruction = user_instruction
+        self.selected_user_instruction = None
 
         # 其他状态变量
         self.llm_anchors = None
@@ -90,10 +94,15 @@ class AdversarialScenarioGenerator:
             planning_agent_ids = [agent["id"] for agent in env_state["agents"]]
             scene_image = env.render_llm_scene_image(agent_ids=planning_agent_ids)
 
-        # 3. 调用大模型搜索攻击对象、制定策略并生成轨迹锚点。
+        # 3. 每次攻击只抽取一条自然语言需求，避免冲突指令共同约束同一计划。
+        selected_instruction = self._sample_user_instruction()
+        if selected_instruction:
+            print(f"[对抗场景生成器] 本次攻击使用的自然语言指令：{selected_instruction[0]}")
+
+        # 4. 调用大模型搜索攻击对象、制定策略并生成轨迹锚点。
         attack_plan = self.llm_planner.generate_attack_plan(
             env_state,
-            self.user_instruction,
+            selected_instruction,
             scene_image=scene_image,
         )
         # 无论计划是否有效，请求已完成，均记录查询帧以避免逐帧重试。
@@ -163,6 +172,19 @@ class AdversarialScenarioGenerator:
         self.llm_anchors = anchors
         self.diffusion_trajectory = None
         env.set_attack_intent(target_id=target_id, anchors=anchors, strategy=strategy)
+
+    def _sample_user_instruction(self):
+        """从有效用户指令中随机抽取一条，供本次攻击规划独占使用。"""
+        candidates = [
+            str(instruction).strip()
+            for instruction in (self.user_instruction or [])
+            if str(instruction).strip()
+        ]
+        if not candidates:
+            self.selected_user_instruction = None
+            return []
+        self.selected_user_instruction = random.choice(candidates)
+        return [self.selected_user_instruction]
 
     def evaluate_reaction(self, env, info):
         """评估自车反应：保留碰撞/TTC统计，并额外采集二维 EA。"""

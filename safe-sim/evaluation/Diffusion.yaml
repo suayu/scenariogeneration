@@ -1,0 +1,6 @@
+planner:
+  ckpt_dir: safesim_checkpoints/safesim_fut32/test/run0
+  ckpt_key: 70000
+predictor:
+  ckpt_dir: safesim_checkpoints/nusc_dynUnicycle_gl0_yrl0_tfTrue_4130553/run0/checkpoints
+  ckpt_key: 94000

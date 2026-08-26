@@ -83,6 +83,10 @@ class Simulator:
                 max_neighbors=traffic_cfg.max_neighbors,
                 num_samples=traffic_cfg.num_samples,
                 sample_step=traffic_cfg.sample_step,
+                diffusion_agent_limit=traffic_cfg.get('diffusion_agent_limit', 0),
+                far_agent_mode=traffic_cfg.get('far_agent_mode', 'guided'),
+                mixed_precision=traffic_cfg.get('mixed_precision', False),
+                multi_gpu_devices=traffic_cfg.get('multi_gpu_devices', []),
                 guidance_config=traffic_cfg.get('guidance'),
                 anchor_guidance_enabled=False if anchor_cfg is None else anchor_cfg.enabled,
                 anchor_guidance_strength=0.2 if anchor_cfg is None else anchor_cfg.strength,
@@ -286,10 +290,54 @@ class Simulator:
         if self.traffic_backend != 'safe_sim_diffusion':
             return None
         frame = self.get_scenario_frame(self.diffusion_controller.adapter.history_frames)
-        joint_trajectory = self.diffusion_controller.predict(
-            frame,
-            attack_intent=self.attack_intent,
-        )
+        interval = int(getattr(self.cfg.sim.traffic_model, 'replan_interval_steps', 1))
+        if interval < 1:
+            raise ValueError('replan_interval_steps must be at least one')
+        attack_key = None
+        if self.attack_intent is not None:
+            attack_key = (
+                int(self.attack_intent['target_id']),
+                int(self.attack_intent['source_step']),
+                str(self.attack_intent['strategy']),
+            )
+        cached = self._cached_joint_trajectory
+        reuse_offset = 0 if cached is None else int(frame.step - cached.source_step)
+        active_ids = np.flatnonzero(self.agent_active)
+        if (
+            cached is not None
+            and 0 < reuse_offset < interval
+            and reuse_offset < cached.positions_global.shape[1]
+            and np.array_equal(cached.agent_ids, active_ids)
+            and attack_key == self._cached_attack_key
+        ):
+            # 为当前仿真步创建视图，使消费逻辑仍然只执行轨迹的第一帧。
+            metadata = dict(cached.metadata)
+            metadata.update({
+                'replan_reused': True,
+                'replan_cache_offset': reuse_offset,
+                'replan_interval_steps': interval,
+            })
+            joint_trajectory = JointTrajectory(
+                source_step=frame.step,
+                agent_ids=cached.agent_ids.copy(),
+                positions_global=cached.positions_global[:, reuse_offset:].copy(),
+                yaws_global=cached.yaws_global[:, reuse_offset:].copy(),
+                velocities_global=cached.velocities_global[:, reuse_offset:].copy(),
+                valid_mask=cached.valid_mask[:, reuse_offset:].copy(),
+                metadata=metadata,
+            )
+        else:
+            joint_trajectory = self.diffusion_controller.predict(
+                frame,
+                attack_intent=self.attack_intent,
+            )
+            joint_trajectory.metadata.update({
+                'replan_reused': False,
+                'replan_cache_offset': 0,
+                'replan_interval_steps': interval,
+            })
+            self._cached_joint_trajectory = joint_trajectory
+            self._cached_attack_key = attack_key
         self.inject_joint_trajectory(joint_trajectory)
         return joint_trajectory
 
@@ -746,6 +794,9 @@ class Simulator:
         self.t = 0
         self.current_scene_id = os.path.basename(self.test_files[i])
         self.pending_joint_trajectory = None
+        # 缓存仅服务于显式启用的低频重规划，场景切换时必须清空。
+        self._cached_joint_trajectory = None
+        self._cached_attack_key = None
         self.attack_intent = None
         # 障碍物不跨场景保留；clear 会同时释放对应的后端对象。
         self.obstacle_wrapper.clear()

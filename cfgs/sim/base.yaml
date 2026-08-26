@@ -34,15 +34,23 @@ traffic_model:
   history_frames: 11 # 权重所需历史帧数加当前帧
   prediction_horizon: 32
   max_neighbors: 20
-  num_samples: 20
-  sample_step: 1
+  # 默认性能配置：100 个训练步中每隔 4 步采样，即 25 次反向扩散。
+  num_samples: 8
+  sample_step: 4
+  # 每次预测连续执行两帧；仍保持全参与者完整引导与单卡 FP32 推理。
+  replan_interval_steps: 2
+  diffusion_agent_limit: 0
+  # guided 保持所有车辆完整引导；unguided_diffusion 仅引导目标及邻车。
+  far_agent_mode: guided
+  mixed_precision: False
+  multi_gpu_devices: []
   guidance:
     # 启动时只需覆盖 mode：unguided、default、llm_joint、manual。
     mode: unguided
     params:
       inner_lr: 0.2 # 每个反向扩散步中的引导梯度步长
       inner_beta: 0.5 # 单次引导对控制量的最大修正幅度
-      n_guide_steps: 3 # 每个反向扩散步执行三次引导，使强安全屏障充分生效
+      n_guide_steps: 2 # 每个反向扩散步执行两次引导，平衡锚点约束和推理时延
       scale_grad_by_std: True # 按当前扩散噪声方差缩放梯度
       grad_wrt: clean_guide
     default:
@@ -51,7 +59,14 @@ traffic_model:
       configs: {}
     llm_joint:
       # 顺序固定为：几何防重叠、道路中心线、自车 TTC 风险、LLM 锚点。
-      weights: [2.0, 1.0, 2.0, 3.0]
+      # 具名静态权重变量；当前运行期间不更新，供后续迭代策略接入。
+      weight_variables:
+        scenario_collision: 1.5
+        route: 1.0
+        scenario_ttc: 2.0
+        llm_anchor: 4.0
+      # 顺序与 Safe-Sim 的引导函数严格对应。
+      weights: ["${..weight_variables.scenario_collision}", "${..weight_variables.route}", "${..weight_variables.scenario_ttc}", "${..weight_variables.llm_anchor}"]
       configs: {}
     loss_configs:
       scenario_collision:
