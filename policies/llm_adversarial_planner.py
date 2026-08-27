@@ -252,6 +252,7 @@ class LLMAdversarialPlanner:
         env_state_json,
         user_instruction=None,
         include_image=None,
+        adversarial_context=None,
     ):
         """构造动态轨迹攻击（可选联合静态障碍物）的完整提示词。
 
@@ -362,6 +363,11 @@ class LLMAdversarialPlanner:
             final_input_description = "the JSON state and the user instructions"
 
         # 第四步：组装主提示词。其内容按“输入契约→未来推演→可行性门控→输出契约”排列。
+        # 仅在迭代攻击开启并已形成画像时扩展提示词；否则提示词逐字保持旧版本。
+        context_section = ""
+        if adversarial_context:
+            context_section = "\n### Online ego-response profile\nUse this prior black-box response summary to prefer a feasible strategy; it never overrides safety constraints.\n<ego_response_profile>\n%s\n</ego_response_profile>\n" % json.dumps(adversarial_context, ensure_ascii=False)
+
         prompt = f"""
         You are an expert in autonomous driving safety testing and adversarial scenario generation. Your task is to decide whether to create a safety-critical test case for the ego vehicle using the attack capabilities enabled in this request.
 
@@ -393,6 +399,8 @@ class LLMAdversarialPlanner:
         <user_preference>
         {instruction_str}
         </user_preference>
+
+        {context_section}
 
         The JSON object uses an ego-centric local coordinate frame: the ego is at `[0, 0]`,
         positive y points forward along the ego heading, and positive x points to the ego's
@@ -750,7 +758,7 @@ Current scene state:
             if any(np.linalg.norm(center - existing) < 2.0 for existing in existing_centers):
                 raise ValueError("障碍物不能与已有静态障碍物重叠")
 
-    def generate_attack_plan(self, env_state, user_instruction, scene_image=None):
+    def generate_attack_plan(self, env_state, user_instruction, scene_image=None, adversarial_context=None):
         if not self.available or self.client is None:
             return None
 
@@ -762,6 +770,7 @@ Current scene state:
             env_state_json,
             user_instruction,
             include_image=self.use_multimodal,
+            adversarial_context=adversarial_context,
         )
         try:
             reasoning, attack_plan = self._request_attack_plan(prompt, scene_image)

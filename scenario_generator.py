@@ -5,6 +5,13 @@ import numpy as np
 from policies.llm_adversarial_planner import LLMAdversarialPlanner
 from policies.risk_metrics import AdversarialRiskMetrics
 
+_ITERATIVE_STAGES = (
+    {"llm_anchor": 4.00, "scenario_ttc": 2.00, "inner_lr": .20, "inner_beta": .50, "n_guide_steps": 2},
+    {"llm_anchor": 4.25, "scenario_ttc": 2.15, "inner_lr": .21, "inner_beta": .52, "n_guide_steps": 2},
+    {"llm_anchor": 4.50, "scenario_ttc": 2.30, "inner_lr": .22, "inner_beta": .54, "n_guide_steps": 2},
+    {"llm_anchor": 4.75, "scenario_ttc": 2.45, "inner_lr": .23, "inner_beta": .56, "n_guide_steps": 2},
+)
+
 class AdversarialScenarioGenerator:
     """对抗性危险场景生成器：统筹大模型决策、扩散模型细化与评估反馈"""
     def __init__(self, cfg, user_instruction: list, llm_planner=None):
@@ -51,6 +58,11 @@ class AdversarialScenarioGenerator:
         except AttributeError:
             pass
         self.risk_metrics = AdversarialRiskMetrics(evaluation_cfg)
+        self.profile_enabled, self.escalation_enabled = self._read_iterative_switches()
+        self._iterative_stage = 0
+        self._iterative_window = []
+        self._iterative_context = None
+        self._profile_previous = None
 
     def step(self, env, current_t):
         """在仿真主循环中调用，控制低频决策与轨迹注入"""
@@ -62,6 +74,8 @@ class AdversarialScenarioGenerator:
             self.last_attack_frame + self.attack_duration
         )
         if attack_window_expired and getattr(env, "attack_intent", None) is not None:
+            if (self.profile_enabled or self.escalation_enabled):
+                self._finish_iterative_window()
             env.clear_attack_intent()
             self.llm_anchors = None
             self.diffusion_trajectory = None
@@ -100,11 +114,11 @@ class AdversarialScenarioGenerator:
             print(f"[对抗场景生成器] 本次攻击使用的自然语言指令：{selected_instruction[0]}")
 
         # 4. 调用大模型搜索攻击对象、制定策略并生成轨迹锚点。
-        attack_plan = self.llm_planner.generate_attack_plan(
-            env_state,
-            selected_instruction,
-            scene_image=scene_image,
-        )
+        planner_kwargs = {"scene_image": scene_image}
+        # 关闭时不扩展调用契约，保持旧规划器与测试替身完全兼容。
+        if self.profile_enabled:
+            planner_kwargs["adversarial_context"] = self._iterative_context
+        attack_plan = self.llm_planner.generate_attack_plan(env_state, selected_instruction, **planner_kwargs)
         # 无论计划是否有效，请求已完成，均记录查询帧以避免逐帧重试。
         self.last_query_frame = env.current_step
 
@@ -172,6 +186,8 @@ class AdversarialScenarioGenerator:
         self.llm_anchors = anchors
         self.diffusion_trajectory = None
         env.set_attack_intent(target_id=target_id, anchors=anchors, strategy=strategy)
+        if self.escalation_enabled:
+            self._apply_iterative_stage(env)
 
     def _sample_user_instruction(self):
         """从有效用户指令中随机抽取一条，供本次攻击规划独占使用。"""
@@ -189,6 +205,8 @@ class AdversarialScenarioGenerator:
     def evaluate_reaction(self, env, info):
         """评估自车反应：保留碰撞/TTC统计，并额外采集二维 EA。"""
         self.risk_metrics.evaluate_ea(env)
+        if (self.profile_enabled or self.escalation_enabled) and getattr(env, "attack_intent", None) is not None:
+            self._record_full_profile(env, info)
         # 记录碰撞
         if info.get('collision', False):
             self.collision_list.append(1.0)
@@ -228,6 +246,63 @@ class AdversarialScenarioGenerator:
         self.llm_anchors = None
         self.diffusion_trajectory = None
         self.risk_metrics.reset_episode()
+        if self.profile_enabled or self.escalation_enabled:
+            self._iterative_stage, self._iterative_window, self._iterative_context = 0, [], None
+            self._profile_previous = None
+
+    def _read_iterative_switches(self):
+        """画像与强度增强分别开关；缺失配置时均保持关闭。"""
+        try:
+            settings = self.cfg.sim.iterative_adversarial
+            return bool(settings.profile_enabled), bool(settings.escalation_enabled)
+        except AttributeError:
+            return False, False
+
+    def _record_full_profile(self, env, info):
+        """从状态转移提取与策略实现无关的完整黑盒驾驶响应。"""
+        state = np.asarray(env.ego_state, dtype=float)
+        speed = float(np.linalg.norm(state[2:4]))
+        heading = float(state[4])
+        previous = self._profile_previous
+        dt = float(getattr(env, "step_time", 0.1))
+        accel = 0.0 if previous is None else (speed - previous["speed"]) / max(dt, 1e-6)
+        jerk = 0.0 if previous is None else (accel - previous["accel"]) / max(dt, 1e-6)
+        yaw_rate = 0.0 if previous is None else np.arctan2(np.sin(heading - previous["heading"]), np.cos(heading - previous["heading"])) / max(dt, 1e-6)
+        route_error = float("nan")
+        try:
+            route = np.asarray(env.get_state_for_planning().get("route", []), dtype=float)
+            if len(route): route_error = float(np.min(np.linalg.norm(route[:, :2] - state[:2], axis=1)))
+        except (AttributeError, TypeError, ValueError):
+            pass
+        item = {"speed": speed, "accel": accel, "jerk": jerk, "yaw_rate": float(yaw_rate),
+                "route_error": route_error, "ttc": self._compute_min_ttc(env),
+                "collision": bool(info.get("collision", False)),
+                "near_miss": self._compute_min_ttc(env) < 1.5}
+        self._profile_previous = {"speed": speed, "accel": accel, "heading": heading}
+        self._iterative_window.append(item)
+
+    def _finish_iterative_window(self):
+        """聚合完整自车画像，并仅在增强开关开启时调整下一阶段。"""
+        if not self._iterative_window:
+            return
+        data = self._iterative_window
+        min_ttc = min(item["ttc"] for item in data)
+        collision = any(item["collision"] for item in data)
+        peak_brake = min(item["accel"] for item in data)
+        peak_turn = max(abs(item["yaw_rate"]) for item in data)
+        peak_jerk = max(abs(item["jerk"]) for item in data)
+        route_errors = [item["route_error"] for item in data if np.isfinite(item["route_error"])]
+        if peak_brake < -2.0: exploit = "forward_pressure"
+        elif peak_turn > .25 or (route_errors and max(route_errors) > 1.5): exploit = "cut_in_or_lateral_conflict"
+        else: exploit = "timing_or_gap_pressure"
+        self._iterative_context = {"stage": self._iterative_stage, "min_ttc": float(min_ttc),
+            "collision": collision, "near_miss_rate": float(np.mean([x["near_miss"] for x in data])),
+            "peak_brake_mps2": float(peak_brake), "peak_jerk_mps3": float(peak_jerk),
+            "peak_yaw_rate_rps": float(peak_turn), "max_route_error_m": float(max(route_errors)) if route_errors else None,
+            "preferred_exploit": exploit}
+        if self.escalation_enabled and not collision:
+            self._iterative_stage = min(self._iterative_stage + 1, len(_ITERATIVE_STAGES) - 1)
+        self._iterative_window = []
 
     def _read_max_consecutive_llm_failures(self):
         """读取可配置的 LLM 连续服务失败阈值，并保留无配置时的安全默认值。"""

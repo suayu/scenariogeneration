@@ -44,6 +44,10 @@ traffic_model:
   far_agent_mode: guided
   mixed_precision: False
   multi_gpu_devices: []
+  # 两项独立关闭；关闭时不改变既有攻击路径。
+  iterative_adversarial:
+    profile_enabled: false
+    escalation_enabled: false
   guidance:
     # 启动时只需覆盖 mode：unguided、default、llm_joint、manual。
     mode: unguided

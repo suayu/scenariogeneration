@@ -325,6 +325,18 @@ class DiffusionModelWrapper:
             )
         return {"functions": functions, "weights": weights, "configs": common_configs}
 
+    def update_iterative_guidance(self, params, weights):
+        """原地更新已加载的 llm_joint 引导配置，供闭环攻击阶段使用。"""
+        if self.guidance_mode != "llm_joint" or len(weights) != len(self.active_guidance_functions):
+            return False
+        for _, policy in self.policy_replicas:
+            net = policy.nets["policy"]
+            net.guide_config.params.update(dict(params))
+            device = next(net.parameters()).device
+            net.Loss_Calculater.weights = torch.as_tensor(weights, dtype=torch.float32, device=device)
+            net.Loss_Calculater.ctrl_weights = net.Loss_Calculater.weights.clone()
+        return True
+
     @staticmethod
     def _find_loss_calculator(root, name):
         """在单损失或组合损失中查找指定计算器。"""
