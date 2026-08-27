@@ -122,6 +122,77 @@ sim.traffic_model.num_samples=5
 
 默认可视化输出位于 `movies/`，逐帧仿真记录位于 `carla_maps/step_data/`。这些运行产物均不会提交到 GitHub。
 
+## 危险场景生成配置参考
+
+所有项目级配置位于 `cfgs/sim/base.yaml`，可用 Hydra 覆盖，例如
+`python run_simulation.py sim.traffic_model.num_samples=8`。密钥仅使用环境变量，不能写入配置或提交。
+
+### 场景、策略与输出
+
+| 配置 | 默认值 | 作用 |
+|---|---:|---|
+| `sim.seed` | `0` | 可复现实验随机种子。 |
+| `sim.mode` | `scenario_dreamer` | 仿真后端场景模式。 |
+| `sim.dataset_path` / `json_path` | metadata 路径 | 场景 pickle / JSON 来源。 |
+| `sim.policy` | `idm` | 被测自车策略，支持 `idm`、`rl`。 |
+| `sim.rl_model_path` / `rl_model_name` | metadata 路径 / `pretrained` | RL 自车权重选择。 |
+| `sim.steps` / `dt` | `400` / `0.1` | 单场景最长闭环步数与仿真步长。 |
+| `sim.simulate_vehicles_only` | `true` | Safe-Sim 权重仅支持车辆时的参与者过滤。 |
+| `sim.agent_scale` | `1.0` | 碰撞检测代理尺寸缩放。 |
+| `sim.visualize` / `lightweight` / `movie_path` | `false` / `false` / `movies` | 视频生成、轻量渲染与输出路径。 |
+| `sim.visualization.show_llm_anchors` / `show_diffusion_trajectory` | `true` / `true` | 绘制 LLM 锚点和细化攻击轨迹。 |
+| `sim.save_carla_data` / `scenario_data_output_path` | `true` / `carla_maps` | CARLA 回放数据输出。 |
+
+### LLM 攻击规划
+
+| 配置 | 默认值 | 作用 |
+|---|---:|---|
+| `sim.llm.model_name` / `model_names` | `qwen3-32b` / 候选列表 | 首选模型及服务失败时的回退顺序。 |
+| `sim.llm.multimodal` | `false` | 是否将当前 BEV 图像与结构化状态一起提交。 |
+| `sim.llm.attack_mode` | `trajectory_only` | `trajectory_only`、`obstacle_only`、`joint`；决定允许的攻击类型。 |
+| `sim.llm.max_consecutive_failures` | `3` | 连续 API 服务失败后，本场景停用 LLM 攻击。 |
+| `sim.llm.obstacles.enabled` | `false` | 旧版兼容项；新流程以 `attack_mode` 为准。 |
+
+### Safe-Sim 扩散与联合引导
+
+| 配置 | 默认值 | 作用 |
+|---|---:|---|
+| `sim.traffic_model.backend` | `safe_sim_diffusion` | 背景交通后端。 |
+| `safe_sim_root` / `config_path` / `checkpoint_path` | Safe-Sim 路径 | Safe-Sim 源码、模型配置与权重位置。 |
+| `device` / `multi_gpu_devices` | `cuda:0` / `[]` | 默认单卡，列表非空时启用持久多卡副本。 |
+| `history_frames` / `prediction_horizon` / `max_neighbors` | `11` / `32` / `20` | 模型输入历史、预测时域、邻居上限；须匹配 checkpoint。 |
+| `num_samples` / `sample_step` | `8` / `4` | 每帧候选数与反向扩散步间隔。 |
+| `replan_interval_steps` | `2` | 连续执行同一预测的步数，再重新扩散。 |
+| `diffusion_agent_limit` / `far_agent_mode` | `0` / `guided` | `0` 为全车扩散；远车可保持引导或走无引导扩散。 |
+| `mixed_precision` | `false` | 扩散去噪器混合精度开关。 |
+| `guidance.mode` | `unguided` | `unguided`、`default`、`llm_joint`、`manual`。 |
+| `guidance.params.inner_lr` / `inner_beta` / `n_guide_steps` | `.2` / `.5` / `2` | 每个反向步的引导梯度强度、最大更新和次数。 |
+| `guidance.params.scale_grad_by_std` / `grad_wrt` | `true` / `clean_guide` | 梯度方差缩放及求导变量。 |
+| `guidance.default.weights` | `[2,1,2]` | 碰撞、路线、TTC 默认损失权重。 |
+| `guidance.llm_joint.weight_variables` | `[1.5,1,2,4]` | 依次为碰撞、路线、TTC、LLM 锚点的初始权重。 |
+| `guidance.manual.functions` / `weights` / `configs` | 三项默认损失 | `manual` 模式下的严格组合。 |
+| `anchor_guidance.*` | 兼容配置 | 旧锚点接口；存在 `guidance.mode` 时以新模式为准。 |
+
+`guidance.loss_configs` 还提供逐项损失细节：`scenario_collision` 的安全边界、接触阶段、穿透屏障与速度/加速度/jerk/位移上限；`route` 的车道边界和非线性惩罚；`scenario_ttc` 的距离、时间带宽和最大 TTC。这些参数控制攻击的物理合理性与道路约束，不建议在没有回归评估时放宽。
+
+### 闭环画像与阶段增强
+
+| 配置 | 默认值 | 作用 |
+|---|---:|---|
+| `sim.traffic_model.iterative_adversarial.profile_enabled` | `false` | 收集完整黑盒自车画像，并将摘要提供给下一轮 LLM。 |
+| `sim.traffic_model.iterative_adversarial.escalation_enabled` | `false` | 在有效动态攻击窗口间逐级更新 `llm_joint` 的 TTC、锚点和引导参数。 |
+
+两项开关相互独立；均关闭时，攻击路径、LLM 调用契约及扩散参数保持既有行为。阶段增强仅在 `llm_joint` 和有效动态攻击目标存在时生效。
+
+### 风险评估
+
+| 配置 | 默认值 | 作用 |
+|---|---:|---|
+| `sim.evaluation.composite.weights` | 加权字典 | 综合危险分数的碰撞、近失、TTC、EA、可达性、可解性、偏离与进度权重。 |
+| `composite.ttc_scale_seconds` / `ea_scale_mps2` | `3` / `3` | TTC 与 EA 归一化尺度。 |
+| `evaluation.ea.*` | 已启用 | EA 时域、采样方向、步长、最大加速度和收敛容差。 |
+| `evaluation.reachability.*` | 已启用 | 可达集时域、网格分辨率、车道带、速度/横向速度和加速度集合。 |
+
 ## 代码入口
 
 - `run_simulation.py`：仿真评估入口；
