@@ -612,6 +612,18 @@ class DiffusionModelWrapper:
                 guidance_data,
             ).reshape(batch_size, num_samples, horizon)
             joint_scores = losses.sum(dim=(0, 2))
+            # 全量迭代模式：在原联合损失之上叠加轻量画像匹配，不改变默认样本选择。
+            intent = model_batch.get("full_adversarial_method")
+            if intent is not None and bool(intent):
+                profile = model_batch.get("adversarial_profile", {})
+                target_rows = torch.nonzero(model_batch["guidance_target_mask"] > 0, as_tuple=False).flatten()
+                if len(target_rows):
+                    traj = positions[int(target_rows[0]), :, :, :2]
+                    lateral = traj[:, :, 0].sub(traj[:, :1, 0]).abs().mean(dim=1)
+                    forward = traj[:, :, 1].sub(traj[:, :1, 1]).abs().mean(dim=1)
+                    exploit = profile.get("preferred_exploit") if isinstance(profile, dict) else None
+                    match = -lateral if exploit == "forward_pressure" else (lateral if exploit == "cut_in_or_lateral_conflict" else forward)
+                    joint_scores = joint_scores - 0.05 * match
             joint_scores[0] = torch.inf
             selected_index = int(torch.argmin(joint_scores).item())
 

@@ -5,6 +5,9 @@ import numpy as np
 from policies.llm_adversarial_planner import LLMAdversarialPlanner
 from policies.risk_metrics import AdversarialRiskMetrics
 
+_STRATEGIES = ("cut_in", "hard_brake", "slow_down", "lane_change", "occlusion", "sudden_acceleration", "others")
+_POLICY_ATTACK_MEMORY = {}
+
 _ITERATIVE_STAGES = (
     {"llm_anchor": 4.00, "scenario_ttc": 2.00, "inner_lr": .20, "inner_beta": .50, "n_guide_steps": 2},
     {"llm_anchor": 4.25, "scenario_ttc": 2.15, "inner_lr": .21, "inner_beta": .52, "n_guide_steps": 2},
@@ -44,10 +47,17 @@ class AdversarialScenarioGenerator:
         self.near_miss_list = []
         self.ttc_list = []
         self._current_episode_min_ttc = float('inf')
+        # 单场景攻击统计用于批量评测及代表性视频筛选。
+        self._episode_attack_plan_count = 0
+        self._episode_attack_active_frames = 0
+        self._episode_obstacle_plan_count = 0
 
         # 用户指令
         self.user_instruction = user_instruction
         self.selected_user_instruction = None
+        # 指令按场景循环：同一场景内的所有 LLM 查询共享同一条自然语言指令。
+        self._scene_instruction_index = -1
+        self._scene_instruction = None
 
         # 其他状态变量
         self.llm_anchors = None
@@ -58,11 +68,13 @@ class AdversarialScenarioGenerator:
         except AttributeError:
             pass
         self.risk_metrics = AdversarialRiskMetrics(evaluation_cfg)
-        self.profile_enabled, self.escalation_enabled = self._read_iterative_switches()
+        self.profile_enabled, self.escalation_enabled, self.full_method_enabled = self._read_iterative_switches()
         self._iterative_stage = 0
         self._iterative_window = []
         self._iterative_context = None
         self._profile_previous = None
+        self._recent_attack_context = None
+        self._recent_attack_expired_step = None
 
     def step(self, env, current_t):
         """在仿真主循环中调用，控制低频决策与轨迹注入"""
@@ -76,6 +88,9 @@ class AdversarialScenarioGenerator:
         if attack_window_expired and getattr(env, "attack_intent", None) is not None:
             if (self.profile_enabled or self.escalation_enabled):
                 self._finish_iterative_window()
+            # 保留刚结束攻击的意图与锚点，供短暂重规划窗口保持策略连续性。
+            self._recent_attack_context = dict(env.attack_intent)
+            self._recent_attack_expired_step = current_t
             env.clear_attack_intent()
             self.llm_anchors = None
             self.diffusion_trajectory = None
@@ -118,6 +133,10 @@ class AdversarialScenarioGenerator:
         # 关闭时不扩展调用契约，保持旧规划器与测试替身完全兼容。
         if self.profile_enabled:
             planner_kwargs["adversarial_context"] = self._iterative_context
+        if self._has_recent_attack_context(env.current_step):
+            planner_kwargs["previous_attack_context"] = self._recent_attack_context
+        if self.full_method_enabled and (self.profile_enabled or self.escalation_enabled) and hasattr(self.llm_planner, "_build_prompt"):
+            planner_kwargs["strategy_prior"] = self._strategy_prior()
         attack_plan = self.llm_planner.generate_attack_plan(env_state, selected_instruction, **planner_kwargs)
         # 无论计划是否有效，请求已完成，均记录查询帧以避免逐帧重试。
         self.last_query_frame = env.current_step
@@ -156,6 +175,7 @@ class AdversarialScenarioGenerator:
                 print(f"[对抗场景生成器] 障碍物计划创建失败，已跳过：{error}")
             else:
                 self.last_attack_frame = env.current_step
+                self._episode_obstacle_plan_count += 1
                 print(f"[对抗场景生成器] 已创建 {len(created_obstacles)} 个静态障碍物。")
         if not attack_requested:
             self.llm_anchors = None
@@ -186,24 +206,29 @@ class AdversarialScenarioGenerator:
         self.llm_anchors = anchors
         self.diffusion_trajectory = None
         env.set_attack_intent(target_id=target_id, anchors=anchors, strategy=strategy)
+        self._episode_attack_plan_count += 1
         if self.escalation_enabled:
             self._apply_iterative_stage(env)
 
     def _sample_user_instruction(self):
-        """从有效用户指令中随机抽取一条，供本次攻击规划独占使用。"""
-        candidates = [
-            str(instruction).strip()
-            for instruction in (self.user_instruction or [])
-            if str(instruction).strip()
-        ]
+        """返回当前场景固定指令；场景切换时再按输入顺序循环下一条。"""
+        if not self._scene_instruction:
+            self._advance_scene_instruction()
+        self.selected_user_instruction = self._scene_instruction
+        return [self.selected_user_instruction] if self.selected_user_instruction else []
+
+    def _advance_scene_instruction(self):
+        candidates = [str(item).strip() for item in (self.user_instruction or []) if str(item).strip()]
         if not candidates:
-            self.selected_user_instruction = None
-            return []
-        self.selected_user_instruction = random.choice(candidates)
-        return [self.selected_user_instruction]
+            self._scene_instruction = None
+            return
+        self._scene_instruction_index = (self._scene_instruction_index + 1) % len(candidates)
+        self._scene_instruction = candidates[self._scene_instruction_index]
 
     def evaluate_reaction(self, env, info):
         """评估自车反应：保留碰撞/TTC统计，并额外采集二维 EA。"""
+        if getattr(env, "attack_intent", None) is not None:
+            self._episode_attack_active_frames += 1
         self.risk_metrics.evaluate_ea(env)
         if (self.profile_enabled or self.escalation_enabled) and getattr(env, "attack_intent", None) is not None:
             self._record_full_profile(env, info)
@@ -238,6 +263,10 @@ class AdversarialScenarioGenerator:
     def reset_episode_stats(self):
         """每个场景开始前重置单回合统计"""
         self._current_episode_min_ttc = float('inf')
+        self._episode_attack_plan_count = 0
+        self._episode_attack_active_frames = 0
+        self._episode_obstacle_plan_count = 0
+        self._advance_scene_instruction()
         self._llm_call_times = 0
         self._attacks_enabled = bool(getattr(self.llm_planner, "available", True))
         self._consecutive_llm_failures = 0
@@ -249,14 +278,23 @@ class AdversarialScenarioGenerator:
         if self.profile_enabled or self.escalation_enabled:
             self._iterative_stage, self._iterative_window, self._iterative_context = 0, [], None
             self._profile_previous = None
+        self._recent_attack_context = None
+        self._recent_attack_expired_step = None
+
+    def _has_recent_attack_context(self, current_step):
+        """攻击结束后 1.5 个查询周期内，向下一次 LLM 查询提供连续性上下文。"""
+        if self._recent_attack_context is None or self._recent_attack_expired_step is None:
+            return False
+        return 0 <= current_step - self._recent_attack_expired_step < 1.5 * self.attack_frequency
 
     def _read_iterative_switches(self):
         """画像与强度增强分别开关；缺失配置时均保持关闭。"""
         try:
             settings = self.cfg.sim.iterative_adversarial
-            return bool(settings.profile_enabled), bool(settings.escalation_enabled)
+            profile, escalation = bool(settings.profile_enabled), bool(settings.escalation_enabled)
+            return profile, escalation, bool(settings.full_method_enabled) and (profile or escalation)
         except AttributeError:
-            return False, False
+            return False, False, False
 
     def _record_full_profile(self, env, info):
         """从状态转移提取与策略实现无关的完整黑盒驾驶响应。"""
@@ -268,17 +306,20 @@ class AdversarialScenarioGenerator:
         accel = 0.0 if previous is None else (speed - previous["speed"]) / max(dt, 1e-6)
         jerk = 0.0 if previous is None else (accel - previous["accel"]) / max(dt, 1e-6)
         yaw_rate = 0.0 if previous is None else np.arctan2(np.sin(heading - previous["heading"]), np.cos(heading - previous["heading"])) / max(dt, 1e-6)
-        route_error = float("nan")
+        route_error, route_progress = float("nan"), float("nan")
         try:
             route = np.asarray(env.get_state_for_planning().get("route", []), dtype=float)
-            if len(route): route_error = float(np.min(np.linalg.norm(route[:, :2] - state[:2], axis=1)))
+            if len(route):
+                distances = np.linalg.norm(route[:, :2] - state[:2], axis=1)
+                route_error, route_progress = float(np.min(distances)), float(np.argmin(distances))
         except (AttributeError, TypeError, ValueError):
             pass
+        progress_loss = 0.0 if previous is None or not np.isfinite(route_progress) else max(0.0, previous.get("route_progress", route_progress) - route_progress)
         item = {"speed": speed, "accel": accel, "jerk": jerk, "yaw_rate": float(yaw_rate),
-                "route_error": route_error, "ttc": self._compute_min_ttc(env),
+                "route_error": route_error, "route_progress": route_progress, "progress_loss": progress_loss, "ttc": self._compute_min_ttc(env),
                 "collision": bool(info.get("collision", False)),
                 "near_miss": self._compute_min_ttc(env) < 1.5}
-        self._profile_previous = {"speed": speed, "accel": accel, "heading": heading}
+        self._profile_previous = {"speed": speed, "accel": accel, "heading": heading, "route_progress": route_progress}
         self._iterative_window.append(item)
 
     def _finish_iterative_window(self):
@@ -300,9 +341,39 @@ class AdversarialScenarioGenerator:
             "peak_brake_mps2": float(peak_brake), "peak_jerk_mps3": float(peak_jerk),
             "peak_yaw_rate_rps": float(peak_turn), "max_route_error_m": float(max(route_errors)) if route_errors else None,
             "preferred_exploit": exploit}
-        if self.escalation_enabled and not collision:
+        if self.full_method_enabled:
+            state = "overstrong_or_unsolvable" if collision or min_ttc < .5 else ("risk_insufficient" if min_ttc > 2.5 else "high_risk_solvable")
+            self._last_dual_objective_state = state
+            if self._active_attack_strategy:
+                item = self._policy_memory()[self._active_attack_strategy]
+                item["trials"] += 1; item["reward"] += {"risk_insufficient": .25, "high_risk_solvable": 1.0, "overstrong_or_unsolvable": -0.20}[state]; item["solvable"] += int(state != "overstrong_or_unsolvable")
+            if self.escalation_enabled and state == "risk_insufficient": self._iterative_stage = min(self._iterative_stage + 1, len(_ITERATIVE_STAGES) - 1)
+            elif self.escalation_enabled and state == "overstrong_or_unsolvable":
+                # 单次过强仅回退一级；保留攻击意图与历史策略，下一窗口继续施压。
+                self._iterative_stage = max(self._iterative_stage - 1, 0)
+        elif self.escalation_enabled and not collision:
             self._iterative_stage = min(self._iterative_stage + 1, len(_ITERATIVE_STAGES) - 1)
         self._iterative_window = []
+
+    def _policy_memory(self):
+        key = str(getattr(getattr(self.cfg, "sim", None), "policy", "unknown"))
+        return _POLICY_ATTACK_MEMORY.setdefault(key, {x: {"trials": 0, "reward": 0.0, "solvable": 0} for x in _STRATEGIES})
+
+    def _strategy_prior(self):
+        table = self._policy_memory()
+        return sorted(({"strategy": k, "trials": v["trials"], "mean_reward": round(v["reward"] / v["trials"], 3) if v["trials"] else 0.0, "solvable_rate": round(v["solvable"] / v["trials"], 3) if v["trials"] else 0.0} for k, v in table.items()), key=lambda x: x["mean_reward"], reverse=True)
+
+    def _apply_iterative_stage(self, env):
+        """分层控制：语义层来自策略先验，几何/扩散层按画像更新。"""
+        controller = getattr(env, "diffusion_controller", None)
+        if controller is None or not hasattr(controller, "update_iterative_guidance"):
+            return
+        stage = _ITERATIVE_STAGES[self._iterative_stage]
+        exploit = (self._iterative_context or {}).get("preferred_exploit")
+        ttc, anchor = stage["scenario_ttc"], stage["llm_anchor"]
+        if exploit == "forward_pressure": ttc += .10
+        elif exploit: anchor += .10
+        controller.update_iterative_guidance({k: stage[k] for k in ("inner_lr", "inner_beta", "n_guide_steps")}, [1.5, 1.0, ttc, anchor])
 
     def _read_max_consecutive_llm_failures(self):
         """读取可配置的 LLM 连续服务失败阈值，并保留无配置时的安全默认值。"""

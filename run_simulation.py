@@ -8,9 +8,11 @@ import numpy as np
 import torch
 import random 
 from tqdm import tqdm
-from utils.viz import generate_video
+from utils.viz import generate_video, generate_multi_scenario_evaluation_visualization
+import csv
 import json
 import os
+from pathlib import Path
 from scenario_generator import AdversarialScenarioGenerator
 from policies.risk_metrics import compute_scenario_danger_score
 
@@ -58,6 +60,8 @@ class PolicyEvaluator:
         self.off_route = []
         self.completed = []
         self.progress = []
+        # 保存逐场景评分，综合能力分严格取其简单平均。
+        self.episode_results = []
         # 重置CARLA数据
     
     def update_running_statistics(self, info):
@@ -68,6 +72,43 @@ class PolicyEvaluator:
         self.progress.append(info['progress'])
 
     
+    def _metric_offsets(self):
+        """记录当前累计指标边界，以便从全局统计中切出单场景数据。"""
+        risk = self.generator.risk_metrics
+        return {"collision": len(self.generator.collision_list), "near_miss": len(self.generator.near_miss_list), "ttc": len(self.generator.ttc_list), "ea": len(risk.ea_values), "reachability": len(risk.reachability_events)}
+
+    def _build_episode_result(self, scenario_index, info, offsets):
+        """计算单个场景的危险度与能力分，不使用跨场景聚合指标。"""
+        risk = self.generator.risk_metrics
+        ea_values = risk.ea_values[offsets["ea"]:]
+        events = risk.reachability_events[offsets["reachability"]:]
+        ttc_values = self.generator.ttc_list[offsets["ttc"]:]
+        finite_events = [event for event in events if np.isfinite(event["difficulty"])]
+        metrics = {"collision rate": float(bool(info.get("collision", False))), "off route rate": float(bool(info.get("off_route", False))), "completed rate": float(bool(info.get("completed", False))), "progress": float(np.clip(info.get("progress", 0.0), 0.0, 1.0)), "collision_rate": float(np.mean(self.generator.collision_list[offsets["collision"]:])) if len(self.generator.collision_list) > offsets["collision"] else 0.0, "near_miss_rate": float(np.mean(self.generator.near_miss_list[offsets["near_miss"]:])) if len(self.generator.near_miss_list) > offsets["near_miss"] else 0.0, "avg_min_ttc": float(np.mean(ttc_values)) if ttc_values else float("inf"), "max_evasive_acceleration_mps2": float(max(ea_values)) if ea_values else 0.0, "mean_evasive_acceleration_mps2": float(np.mean(ea_values)) if ea_values else 0.0, "reachability_event_count": len(events)}
+        if finite_events:
+            hardest = max(finite_events, key=lambda event: event["difficulty"])
+            metrics.update({"reachability_difficulty": float(hardest["difficulty"]), "mean_reachability_difficulty": float(np.mean([event["difficulty"] for event in finite_events])), "dangerous_scene_solvable": float(hardest["dangerous_solvable"])})
+        danger = compute_scenario_danger_score(metrics, getattr(getattr(self.cfg, "evaluation", None), "composite", None))
+        ability_cfg = getattr(getattr(self.cfg, "evaluation", None), "autonomous_driving", None)
+        coefficient = float(np.clip(getattr(ability_cfg, "partial_progress_coefficient", 0.5), 0.0, 1.0))
+        complete = bool(metrics["completed rate"] and not metrics["collision rate"] and not metrics["off route rate"])
+        partial_credit = 0.0 if complete else coefficient * metrics["progress"]
+        return {"scenario_index": int(scenario_index), "scenario_danger_score": float(danger), "complete_success": complete, "progress": metrics["progress"], "partial_progress_coefficient": coefficient, "partial_credit": float(partial_credit), "autonomous_driving_ability_score": float(100.0 * danger * (float(complete) + partial_credit)), "collision": bool(metrics["collision rate"]), "off_route": bool(metrics["off route rate"]), "completed": bool(metrics["completed rate"]), "attack_plan_count": int(self.generator._episode_attack_plan_count), "attack_active_frames": int(self.generator._episode_attack_active_frames), "obstacle_plan_count": int(self.generator._episode_obstacle_plan_count), "video_path": str(Path(str(self.cfg.movie_path)) / f"scenario_{scenario_index:03d}" / f"scenario_{scenario_index:03d}.mp4")}
+
+    def _write_multi_scenario_results(self, all_metrics):
+        """输出逐场景 JSON、CSV 与汇总图，供多场景模型能力对比使用。"""
+        if not self.episode_results:
+            return
+        output_dir = Path(str(self.cfg.movie_path)); output_dir.mkdir(parents=True, exist_ok=True)
+        json_path, csv_path, plot_path = output_dir / "multi_scenario_ability_results.json", output_dir / "multi_scenario_ability_results.csv", output_dir / "multi_scenario_ability_summary.png"
+        # 先写入产物路径，使 JSON 本身也能作为多场景评测的完整索引。
+        all_metrics.update({"multi_scenario_results_json": str(json_path), "multi_scenario_results_csv": str(csv_path), "multi_scenario_results_visualization": str(plot_path)})
+        with json_path.open("w", encoding="utf-8") as handle: json.dump({"aggregate": all_metrics, "episodes": self.episode_results}, handle, ensure_ascii=False, indent=2)
+        with csv_path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(self.episode_results[0])); writer.writeheader(); writer.writerows(self.episode_results)
+        generate_multi_scenario_evaluation_visualization(self.episode_results, str(plot_path))
+        all_metrics.update({"multi_scenario_results_json": str(json_path), "multi_scenario_results_csv": str(csv_path), "multi_scenario_results_visualization": str(plot_path)})
+
     def compute_metrics(self):
         """ Compute evaluation metrics based on accumulated statistics."""
         base_metrics = {
@@ -86,6 +127,19 @@ class PolicyEvaluator:
             all_metrics,
             composite_cfg,
         )
+        # 综合能力分为所有场景独立表现分的简单算术平均。
+        if self.episode_results:
+            scores = np.asarray([item["autonomous_driving_ability_score"] for item in self.episode_results], dtype=float)
+            all_metrics["autonomous_driving_ability_score"] = float(scores.mean())
+            all_metrics["evaluated_scenario_count"] = int(len(scores))
+            all_metrics["configured_max_scenarios"] = int(getattr(getattr(self.cfg, "evaluation", None), "max_scenarios", 0))
+            all_metrics["mean_per_scene_danger_score"] = float(np.mean([item["scenario_danger_score"] for item in self.episode_results]))
+            all_metrics["danger_weighted_complete_success"] = float(np.mean([item["scenario_danger_score"] * float(item["complete_success"]) for item in self.episode_results]))
+            all_metrics["danger_weighted_partial_progress"] = float(np.mean([item["scenario_danger_score"] * item["partial_credit"] for item in self.episode_results]))
+        else:
+            all_metrics["autonomous_driving_ability_score"] = 0.0
+            all_metrics["evaluated_scenario_count"] = 0
+            all_metrics["configured_max_scenarios"] = int(getattr(getattr(self.cfg, "evaluation", None), "max_scenarios", 0))
         return all_metrics, ["{}: {:.6f}".format(k,v) for (k,v) in all_metrics.items()]
 
     def evaluate_policy(self):
@@ -93,10 +147,14 @@ class PolicyEvaluator:
         self.reset()
         
         # 遍历所有测试场景
-        for i in tqdm(range(self.env.num_test_scenarios)):
+        max_scenarios = int(getattr(getattr(self.cfg, "evaluation", None), "max_scenarios", 0))
+        scenario_count = self.env.num_test_scenarios if max_scenarios <= 0 else min(max_scenarios, self.env.num_test_scenarios)
+        for i in tqdm(range(scenario_count)):
             print(f"Simulating environment {i}")
             obs = self.env.reset(i)
 
+            # 记录累计指标边界；后续只使用本场景产生的数据计算独立得分。
+            metric_offsets = self._metric_offsets()
             # 重置单回合对抗统计
             self.generator.reset_episode_stats()
 
@@ -125,7 +183,9 @@ class PolicyEvaluator:
                     #         render_frame = False
                     # observations always rendered in local frame of agent
                     # if render_frame:
-                    self.env.render_state(name=f'{i}', movie_path=self.cfg.movie_path)
+                    # 每个场景独立目录，防止视频合成时混入其它场景的 PNG 帧。
+                    scenario_movie_dir = os.path.join(str(self.cfg.movie_path), f"scenario_{i:03d}")
+                    self.env.render_state(name=f'scenario_{i:03d}', movie_path=scenario_movie_dir)
                 
                 # 3. 自车决策与环境步进
                 action = self.policy.act(obs)
@@ -143,9 +203,11 @@ class PolicyEvaluator:
             # 场景结束时保留原有的回合最小 TTC 汇总。
             self.generator.finalize_episode_stats()
             self.update_running_statistics(info)
+            self.episode_results.append(self._build_episode_result(i, info, metric_offsets))
             
             if self.cfg.visualize:
-                generate_video(name=f'{i}', output_dir=self.cfg.movie_path, delete_images=False)
+                scenario_movie_dir = os.path.join(str(self.cfg.movie_path), f"scenario_{i:03d}")
+                generate_video(name=f'scenario_{i:03d}', output_dir=scenario_movie_dir, delete_images=False)
             
             if self.cfg.verbose:
                 if self.cfg.behaviour_model.compute_metrics and self.env.behaviour_model is not None:
@@ -154,7 +216,9 @@ class PolicyEvaluator:
                 print(self.compute_metrics()[-1])
 
 
-        return self.compute_metrics()
+        metrics, _ = self.compute_metrics()
+        self._write_multi_scenario_results(metrics)
+        return metrics, ["{}: {:.6f}".format(k, v) if isinstance(v, (int, float, np.floating)) else "{}: {}".format(k, v) for (k, v) in metrics.items()]
 
 @hydra.main(version_base=None, config_path=CONFIG_PATH, config_name="config")
 def main(cfg):

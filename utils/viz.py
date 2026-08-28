@@ -12,6 +12,45 @@ import wandb
 
 has_printed_save_fig_path = False
 
+
+def generate_multi_scenario_evaluation_visualization(records, output_path):
+    """绘制多场景能力评测总览：危险度、得分与成功行驶进度。"""
+    if not records:
+        return
+    ordered = sorted(records, key=lambda item: item["scenario_index"])
+    indices = [item["scenario_index"] for item in ordered]
+    danger = [item["scenario_danger_score"] for item in ordered]
+    scores = [item["autonomous_driving_ability_score"] for item in ordered]
+    progress = [item["progress"] for item in ordered]
+    complete = [item["complete_success"] for item in ordered]
+    colors = ["#2ca02c" if value else "#ff7f0e" for value in complete]
+
+    # 左图显示单场景得分构成，右图用于判断危险度与模型表现的对应关系。
+    figure, axes = plt.subplots(1, 2, figsize=(13, 5))
+    axes[0].bar(range(len(ordered)), scores, color=colors, label="场景表现分")
+    axes[0].plot(range(len(ordered)), np.asarray(danger) * 100.0, "o--", color="#d62728", label="危险度 × 100")
+    axes[0].set_xticks(range(len(ordered)))
+    axes[0].set_xticklabels([str(index) for index in indices])
+    axes[0].set_xlabel("场景编号")
+    axes[0].set_ylabel("分数")
+    axes[0].set_title("逐场景能力得分（绿：完整成功；橙：未完成）")
+    axes[0].set_ylim(0, 100)
+    axes[0].grid(axis="y", alpha=0.25)
+    axes[0].legend()
+
+    axes[1].scatter(danger, scores, c=colors, s=85, edgecolors="black", linewidths=0.5)
+    for index, x, y, route_progress in zip(indices, danger, scores, progress):
+        axes[1].annotate(f"{index} ({route_progress:.0%})", (x, y), xytext=(5, 5), textcoords="offset points", fontsize=8)
+    axes[1].set_xlabel("综合场景危险度")
+    axes[1].set_ylabel("自动驾驶模型场景表现分")
+    axes[1].set_title("危险度—表现分布（标注：场景编号与路线进度）")
+    axes[1].set_xlim(0, 1)
+    axes[1].set_ylim(0, 100)
+    axes[1].grid(alpha=0.25)
+    figure.tight_layout()
+    figure.savefig(output_path, dpi=180)
+    plt.close(figure)
+
 def plot_scene(
         agent_states, 
         road_points, 
@@ -659,21 +698,26 @@ def render_state(
 
 
 def generate_video(name, output_dir, delete_images=False):
-    """ Generates a video from a sequence of images saved in a directory."""
-    image_folder = f'{output_dir}'
-    
-    # Get list of all image files in the directory
-    images = [os.path.join(image_folder, img) for img in sorted(os.listdir(image_folder)) if img.endswith(".png")]
-    images = [str1.replace('\n', '') for str1 in images]
-    images.sort()  # Sort by filename
-
-    # Create a video clip from the image sequence
+    """将单场景 PNG 序列编码为视频，避免跨场景混帧并释放编码资源。"""
+    image_folder = str(output_dir)
+    if not os.path.isdir(image_folder):
+        return None
+    # 每个场景调用方使用独立目录；显式按文件名排序，保证帧时序稳定。
+    images = sorted(
+        os.path.join(image_folder, image_name)
+        for image_name in os.listdir(image_folder)
+        if image_name.endswith(".png")
+    )
+    if not images:
+        return None
+    video_path = os.path.join(image_folder, f"{name}.mp4")
     clip = ImageSequenceClip(images, fps=5)
-    # clip = ImageSequenceClip(images, fps=10)
-    
-    # Write the video file
-    clip.write_videofile(f"{image_folder}/{name}.mp4", codec='libx264')
-
+    try:
+        clip.write_videofile(video_path, codec="libx264")
+    finally:
+        # 多场景连续编码时必须关闭句柄，防止文件描述符和内存持续累积。
+        clip.close()
     if delete_images:
         for image in images:
             os.remove(image)
+    return video_path

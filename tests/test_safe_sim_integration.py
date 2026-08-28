@@ -938,7 +938,7 @@ def test_llm_validates_and_converts_an_enabled_obstacle_plan():
     planner = LLMAdversarialPlanner(client=SimpleNamespace(), use_obstacles=True)
     local_plan = [{
         "type": "cone_line",
-        "center": [0.0, 10.0],
+        "center": [0.0, 17.0],
         "yaw": np.pi / 2,
         "count": 3,
         "spacing": 1.0,
@@ -954,5 +954,55 @@ def test_llm_validates_and_converts_an_enabled_obstacle_plan():
     planner._validate_obstacle_plan(local_plan, normalized)
     converted = planner._convert_obstacle_plan_to_global(local_plan, 100.0, 200.0, np.pi / 2)
 
-    np.testing.assert_allclose(converted[0]["center"], [100.0, 210.0])
+    np.testing.assert_allclose(converted[0]["center"], [100.0, 217.0])
     assert converted[0]["yaw"] == np.pi / 2
+
+
+def test_obstacle_validation_uses_materialized_occupancy_and_filters_only_group():
+    planner = LLMAdversarialPlanner(client=SimpleNamespace(), use_obstacles=True)
+    normalized = {"static_obstacles": []}
+    # 中心在 17 m 处的故障车辆前缘仅 14.6 m，必须按真实矩形占用被过滤。
+    near_vehicle = [{
+        "type": "disabled_vehicle", "center": [0.0, 17.0], "yaw": np.pi / 2,
+        "count": 1, "spacing": 1.0,
+    }]
+    assert planner._validate_obstacle_plan(near_vehicle, normalized) == []
+    # 锥桶队列的最近锥桶同样不能借由组中心绕过 15 m 阈值。
+    near_cones = [{
+        "type": "cone_line", "center": [0.0, 16.0], "yaw": np.pi / 2,
+        "count": 3, "spacing": 1.0,
+    }]
+    assert planner._validate_obstacle_plan(near_cones, normalized) == []
+    safe_cones = [{
+        "type": "cone_line", "center": [0.0, 18.0], "yaw": np.pi / 2,
+        "count": 3, "spacing": 1.0,
+    }]
+    assert planner._validate_obstacle_plan(safe_cones, normalized) == safe_cones
+
+
+def test_unsafe_obstacle_group_does_not_discard_valid_dynamic_plan():
+    planner = LLMAdversarialPlanner(client=SimpleNamespace(), use_obstacles=True)
+    raw_plan = {
+        "attack": True,
+        "attack_target_id": 1,
+        "strategy": "lane_change",
+        "anchors": [[0.0, 8.0], [0.0, 12.0], [0.0, 16.0], [0.0, 20.0]],
+        "reason": "动态攻击保持有效",
+        # 中心虽为 17m，故障车前缘却只有 14.6m，必须只过滤该障碍物组。
+        "obstacle_plan": [{
+            "type": "disabled_vehicle", "center": [0.0, 17.0], "yaw": np.pi / 2,
+            "count": 1, "spacing": 1.0,
+        }],
+    }
+    planner._request_attack_plan = lambda *args, **kwargs: ("", dict(raw_plan))
+    env_state = {
+        "ego_state": [100.0, 200.0, 0.0, 5.0, np.pi / 2],
+        "route": [[100.0, 200.0], [100.0, 230.0]],
+        "agents": [{"id": 1, "type": 0, "state": [100.0, 208.0, 0.0, 4.0, np.pi / 2]}],
+        "static_obstacles": [],
+    }
+    result = planner.generate_attack_plan(env_state, ["生成动态攻击"])
+    assert result is not None
+    assert result["attack"] is True
+    assert result["obstacle_plan"] == []
+    assert result["attack_target_id"] == 1

@@ -48,6 +48,7 @@ traffic_model:
   iterative_adversarial:
     profile_enabled: false
     escalation_enabled: false
+    full_method_enabled: false # 仅在轨迹迭代开启时叠加 CAT 记忆与候选画像匹配
   guidance:
     # 启动时只需覆盖 mode：unguided、default、llm_joint、manual。
     mode: unguided
@@ -138,6 +139,11 @@ llm:
   obstacles:
     enabled: False # 兼容旧配置；新逻辑以 llm.attack_mode 为准
 evaluation:
+  autonomous_driving:
+    # 未完成场景的已行驶路线进度折算系数：0 不给部分分，1 为全额进度分。
+    partial_progress_coefficient: 0.5
+  # 0 表示遍历全部数据集；正数时仅运行前 N 个场景，适合可复现的批量评测。
+  max_scenarios: 0
   composite:
     # 各项先归一化到零到一，再按有效权重重新归一化并求加权平均。
     weights:
