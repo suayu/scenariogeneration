@@ -430,6 +430,8 @@ def render_state(
         static_obstacles=None,
         show_llm_anchors=True,
         show_diffusion_trajectory=True,
+        diffusion_candidate_trajectories=None,
+        show_diffusion_candidates=False,
     ):
     """ Renders the current state of the simulation and saves it as a PNG image."""
     global has_printed_save_fig_path
@@ -679,11 +681,21 @@ def render_state(
         )
         ax.plot(anchors[:, 0], anchors[:, 1], color='blue', linestyle='--',
                 linewidth=1.2, zorder=30)
+    if show_diffusion_candidates:
+        # 半透明候选线展示扩散分布；最终入选路线由下方红色实线单独突出。
+        for candidate in diffusion_candidate_trajectories or []:
+            candidate = np.asarray(candidate)
+            if candidate.ndim == 2 and candidate.shape[1] >= 2 and len(candidate):
+                ax.plot(candidate[:, 0], candidate[:, 1], color='tab:orange', alpha=0.24,
+                        linewidth=1.0, zorder=28)
+        if diffusion_candidate_trajectories:
+            ax.plot([], [], color='tab:orange', alpha=0.45, linewidth=1.0,
+                    label='Diffusion Candidate Routes')
     if show_diffusion_trajectory and diffusion_trajectory is not None and len(diffusion_trajectory) > 0:
         diffusion_trajectory = np.asarray(diffusion_trajectory)
         ax.plot(
-            diffusion_trajectory[:, 0], diffusion_trajectory[:, 1], color='red',
-            label='Safe-Sim Attack Trajectory', zorder=29, linewidth=1.6,
+            diffusion_trajectory[:, 0], diffusion_trajectory[:, 1], color='red', alpha=1.0,
+            label='Selected Safe-Sim Attack Trajectory', zorder=29, linewidth=2.2,
         )
 
     plt.tight_layout()

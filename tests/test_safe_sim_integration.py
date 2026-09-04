@@ -628,15 +628,10 @@ def test_llm_json_plan_is_parsed_with_injected_client():
         "reason": "当前没有合适目标",
     }
     response = SimpleNamespace(
-        output=[
-            SimpleNamespace(
-                type="message",
-                content=[SimpleNamespace(text=json.dumps(raw_plan))],
-            )
-        ]
+        choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(raw_plan)))]
     )
     fake_client = SimpleNamespace(
-        responses=SimpleNamespace(create=lambda **kwargs: response)
+        chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **kwargs: response))
     )
     planner = LLMAdversarialPlanner(client=fake_client)
     env_state = {
@@ -1006,3 +1001,82 @@ def test_unsafe_obstacle_group_does_not_discard_valid_dynamic_plan():
     assert result["attack"] is True
     assert result["obstacle_plan"] == []
     assert result["attack_target_id"] == 1
+
+
+def test_llm_provider_aliases_select_explicit_contracts():
+    """三类提供方必须显式选择，避免模型失败后跨服务静默切换。"""
+    client = SimpleNamespace()
+    assert LLMAdversarialPlanner(provider="gpt", client=client).provider == "openai"
+    assert LLMAdversarialPlanner(provider="deepseek", client=client).provider == "deepseek"
+    assert LLMAdversarialPlanner(provider="aliyun", client=client).provider == "dashscope"
+
+
+def test_openai_provider_uses_responses_api_for_json_plan():
+    raw_plan = {"attack": False, "attack_target_id": -1, "strategy": "none", "anchors": []}
+    captured = {}
+
+    def create_response(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(output_text=json.dumps(raw_plan))
+
+    client = SimpleNamespace(responses=SimpleNamespace(create=create_response))
+    planner = LLMAdversarialPlanner(provider="openai", client=client)
+    reasoning, plan = planner._request_attack_plan_once("gpt-5.6", "仅返回 JSON")
+
+    assert reasoning == ""
+    assert plan == raw_plan
+    assert captured["input"][0]["content"][0]["type"] == "input_text"
+    assert captured["reasoning"]["effort"] == "low"
+
+
+def test_deepseek_provider_keeps_compatible_chat_contract():
+    raw_plan = {"attack": False, "attack_target_id": -1, "strategy": "none", "anchors": []}
+    captured = {}
+
+    def create_completion(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(raw_plan)))])
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create_completion)))
+    planner = LLMAdversarialPlanner(provider="deepseek", client=client)
+    _, plan = planner._request_attack_plan_once("deepseek-v4-pro", "仅返回 JSON")
+
+    assert plan == raw_plan
+    assert "extra_body" not in captured
+
+
+def test_gemini_provider_uses_compatible_chat_without_dashscope_fields():
+    """Gemini 通过官方 OpenAI 兼容端点复用 JSON 规划契约。"""
+    raw_plan = {"attack": False, "attack_target_id": -1, "strategy": "none", "anchors": []}
+    captured = {}
+
+    def create_completion(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(raw_plan)))])
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create_completion)))
+    planner = LLMAdversarialPlanner(provider="gemini", client=client)
+    _, plan = planner._request_attack_plan_once("gemini-2.5-flash", "仅返回 JSON")
+
+    assert plan == raw_plan
+    assert planner.api_key_env == "GEMINI_API_KEY"
+    assert "extra_body" not in captured
+
+
+def test_qwen_provider_uses_modelscope_contract_and_disables_thinking():
+    """Qwen3.6 经 ModelScope API Inference 走 OpenAI 兼容请求。"""
+    raw_plan = {"attack": False, "attack_target_id": -1, "strategy": "none", "anchors": []}
+    captured = {}
+
+    def create_completion(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(raw_plan)))])
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create_completion)))
+    planner = LLMAdversarialPlanner(provider="modelscope", client=client)
+    _, plan = planner._request_attack_plan_once("Qwen/Qwen3.6-27B-FP8", "仅返回 JSON")
+
+    assert plan == raw_plan
+    assert planner.provider == "qwen"
+    assert planner.api_key_env == "MODELSCOPE_ACCESS_TOKEN"
+    assert captured["extra_body"] == {"enable_thinking": False}

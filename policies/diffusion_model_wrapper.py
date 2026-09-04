@@ -73,6 +73,7 @@ class DiffusionModelWrapper:
         anchor_max_update=0.5,
         anchor_guide_steps=1,
         anchor_scale_grad_by_std=True,
+        capture_candidate_trajectories=False,
     ):
         self.safe_sim_root = Path(safe_sim_root).expanduser().resolve()
         self.config_path = Path(config_path).expanduser().resolve()
@@ -89,6 +90,8 @@ class DiffusionModelWrapper:
         self.diffusion_agent_limit = int(diffusion_agent_limit)
         self.far_agent_mode = str(far_agent_mode).lower()
         self.mixed_precision = bool(mixed_precision)
+        # 仅在可视化明确开启时保留候选样本，避免常规闭环仿真产生额外 CPU 解码开销。
+        self.capture_candidate_trajectories = bool(capture_candidate_trajectories)
         if self.diffusion_agent_limit < 0:
             raise ValueError("diffusion_agent_limit must be non-negative")
         if self.far_agent_mode not in {"guided", "unguided_diffusion"}:
@@ -747,6 +750,29 @@ class DiffusionModelWrapper:
         positions_local = action.positions.detach().cpu().numpy()
         yaws_local = action.yaws.detach().cpu().numpy()
         joint = self.adapter.decode(frame, safe_batch, positions_local, yaws_local)
+        candidate_trajectories_global = []
+        # 将攻击目标的每个扩散候选样本解码到全局坐标，供可视化显示；不参与控制决策。
+        samples = info.get("action_samples") if isinstance(info, dict) else None
+        if (
+            self.capture_candidate_trajectories
+            and target_id is not None
+            and isinstance(samples, dict)
+            and samples.get("positions") is not None
+            and samples.get("yaws") is not None
+        ):
+            sample_positions = samples["positions"]
+            sample_yaws = samples["yaws"]
+            if sample_positions.ndim == 4 and sample_positions.shape[0] == len(safe_batch.row_to_agent_id):
+                for sample_index in range(sample_positions.shape[1]):
+                    candidate_joint = self.adapter.decode(
+                        frame,
+                        safe_batch,
+                        sample_positions[:, sample_index].detach().cpu().numpy(),
+                        sample_yaws[:, sample_index].detach().cpu().numpy(),
+                    )
+                    candidate = candidate_joint.trajectory_for(target_id)
+                    if candidate is not None:
+                        candidate_trajectories_global.append(candidate[:, :2])
         if far_safe_batch is not None:
             far_joint = self.adapter.decode(
                 frame,
@@ -768,6 +794,7 @@ class DiffusionModelWrapper:
                 "sample_step": self.sample_step,
                 "all_samples_available": "action_samples" in info,
                 "joint_sample_index": joint_sample_index,
+                "candidate_trajectories_global": candidate_trajectories_global,
                 "guidance_mode": self.guidance_mode,
                 "guidance_enabled": self.guidance_enabled,
                 "guidance_functions": list(self.active_guidance_functions),

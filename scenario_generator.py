@@ -1,9 +1,10 @@
 # scenario_generator.py
+import os
 import random
 
 import numpy as np
 from policies.llm_adversarial_planner import LLMAdversarialPlanner
-from policies.risk_metrics import AdversarialRiskMetrics
+from policies.risk_metrics import AdversarialRiskMetrics, compute_scenario_danger_score
 
 _STRATEGIES = ("cut_in", "hard_brake", "slow_down", "lane_change", "occlusion", "sudden_acceleration", "others")
 _POLICY_ATTACK_MEMORY = {}
@@ -22,7 +23,9 @@ class AdversarialScenarioGenerator:
 
         # 大模型规划器由 Simulator 创建，使其生命周期与仿真环境一致。
         self.llm_planner = llm_planner or LLMAdversarialPlanner(
-            model_name=self._read_llm_model_name()
+            model_name=self._read_llm_model_name(),
+            model_names=self._read_llm_model_names(),
+            provider=self._read_llm_provider(),
         )
         self.attack_duration = 10       # 一次攻击持续时间
 
@@ -51,6 +54,9 @@ class AdversarialScenarioGenerator:
         self._episode_attack_plan_count = 0
         self._episode_attack_active_frames = 0
         self._episode_obstacle_plan_count = 0
+        # 保留每次 LLM 主动请求攻击的原因，供实验审计和可视化使用。
+        self._episode_attack_reasons = []
+        self._episode_attack_difficulties = []
 
         # 用户指令
         self.user_instruction = user_instruction
@@ -68,6 +74,7 @@ class AdversarialScenarioGenerator:
         except AttributeError:
             pass
         self.risk_metrics = AdversarialRiskMetrics(evaluation_cfg)
+        self.difficulty_mode, self.target_difficulty, self.difficulty_tolerance = self._read_difficulty_control()
         self.profile_enabled, self.escalation_enabled, self.full_method_enabled = self._read_iterative_switches()
         self._iterative_stage = 0
         self._iterative_window = []
@@ -86,7 +93,7 @@ class AdversarialScenarioGenerator:
             self.last_attack_frame + self.attack_duration
         )
         if attack_window_expired and getattr(env, "attack_intent", None) is not None:
-            if (self.profile_enabled or self.escalation_enabled):
+            if self.profile_enabled or self.escalation_enabled or self.difficulty_mode != "off":
                 self._finish_iterative_window()
             # 保留刚结束攻击的意图与锚点，供短暂重规划窗口保持策略连续性。
             self._recent_attack_context = dict(env.attack_intent)
@@ -164,6 +171,17 @@ class AdversarialScenarioGenerator:
         strategy = attack_plan.get("strategy", "unknown")
         attack_requested = attack_plan.get("attack") is True
         obstacle_plan = attack_plan.get("obstacle_plan", [])
+        if attack_requested:
+            # 仅记录 LLM 明确发起的动态攻击；执行器后续拒绝时也保留原因。
+            self._episode_attack_reasons.append({
+                "step": int(env.current_step),
+                "reason": str(attack_plan.get("reason", "")).strip(),
+                "target_id": target_id,
+                "strategy": str(strategy),
+                "anchor_count": len(anchors) if isinstance(anchors, list) else 0,
+                "requested_obstacle_count": len(obstacle_plan) if isinstance(obstacle_plan, list) else 0,
+                "accepted": False,
+            })
         # 必须在新障碍物或对抗轨迹进入环境前冻结原始可达集。
         if obstacle_plan or attack_requested:
             self.risk_metrics.begin_attack(env)
@@ -207,7 +225,10 @@ class AdversarialScenarioGenerator:
         self.diffusion_trajectory = None
         env.set_attack_intent(target_id=target_id, anchors=anchors, strategy=strategy)
         self._episode_attack_plan_count += 1
-        if self.escalation_enabled:
+        # 当前有效计划对应本轮刚记录的最后一个攻击原因。
+        if self._episode_attack_reasons:
+            self._episode_attack_reasons[-1]["accepted"] = True
+        if self.escalation_enabled or self.difficulty_mode != "off":
             self._apply_iterative_stage(env)
 
     def _sample_user_instruction(self):
@@ -228,9 +249,10 @@ class AdversarialScenarioGenerator:
     def evaluate_reaction(self, env, info):
         """评估自车反应：保留碰撞/TTC统计，并额外采集二维 EA。"""
         if getattr(env, "attack_intent", None) is not None:
-            self._episode_attack_active_frames += 1
+            # 兼容无 __init__ 的轻量测试替身，正式运行仍由回合重置初始化。
+            self._episode_attack_active_frames = getattr(self, "_episode_attack_active_frames", 0) + 1
         self.risk_metrics.evaluate_ea(env)
-        if (self.profile_enabled or self.escalation_enabled) and getattr(env, "attack_intent", None) is not None:
+        if (getattr(self, "profile_enabled", False) or getattr(self, "escalation_enabled", False)) and getattr(env, "attack_intent", None) is not None:
             self._record_full_profile(env, info)
         # 记录碰撞
         if info.get('collision', False):
@@ -266,6 +288,8 @@ class AdversarialScenarioGenerator:
         self._episode_attack_plan_count = 0
         self._episode_attack_active_frames = 0
         self._episode_obstacle_plan_count = 0
+        self._episode_attack_reasons = []
+        self._episode_attack_difficulties = []
         self._advance_scene_instruction()
         self._llm_call_times = 0
         self._attacks_enabled = bool(getattr(self.llm_planner, "available", True))
@@ -341,7 +365,29 @@ class AdversarialScenarioGenerator:
             "peak_brake_mps2": float(peak_brake), "peak_jerk_mps3": float(peak_jerk),
             "peak_yaw_rate_rps": float(peak_turn), "max_route_error_m": float(max(route_errors)) if route_errors else None,
             "preferred_exploit": exploit}
-        if self.full_method_enabled:
+        window_metrics = {
+            "collision_rate": float(collision),
+            "near_miss_rate": float(np.mean([x["near_miss"] for x in data])),
+            "avg_min_ttc": float(min_ttc),
+            **self.risk_metrics.compute_metrics(),
+        }
+        observed_difficulty = compute_scenario_danger_score(window_metrics, self.cfg.sim.evaluation.composite)
+        self._episode_attack_difficulties.append({"difficulty": float(observed_difficulty), "weight": int(len(data)), "stage": int(self._iterative_stage)})
+        self._iterative_context["observed_difficulty"] = float(observed_difficulty)
+        self._iterative_context["difficulty_mode"] = self.difficulty_mode
+        self._iterative_context["target_difficulty"] = float(self.target_difficulty)
+        # 难度控制优先保证可行性：碰撞代表过强，不把它作为提高目标分的奖励。
+        if self.difficulty_mode == "target":
+            if collision or observed_difficulty > self.target_difficulty + self.difficulty_tolerance:
+                self._iterative_stage = max(self._iterative_stage - 1, 0)
+            elif observed_difficulty < self.target_difficulty - self.difficulty_tolerance:
+                self._iterative_stage = min(self._iterative_stage + 1, len(_ITERATIVE_STAGES) - 1)
+        elif self.difficulty_mode == "adaptive":
+            if collision or min_ttc < .5:
+                self._iterative_stage = max(self._iterative_stage - 1, 0)
+            elif min_ttc > 2.5:
+                self._iterative_stage = min(self._iterative_stage + 1, len(_ITERATIVE_STAGES) - 1)
+        elif self.full_method_enabled:
             state = "overstrong_or_unsolvable" if collision or min_ttc < .5 else ("risk_insufficient" if min_ttc > 2.5 else "high_risk_solvable")
             self._last_dual_objective_state = state
             if self._active_attack_strategy:
@@ -382,12 +428,60 @@ class AdversarialScenarioGenerator:
         except (AttributeError, TypeError, ValueError):
             return 3
 
+    def _read_difficulty_control(self):
+        """读取唯一的难度迭代模式，并对目标与容差做安全范围约束。"""
+        try:
+            config = self.cfg.sim.evaluation.difficulty_control
+            mode = str(config.mode).strip().lower()
+            if mode not in {"off", "adaptive", "target"}:
+                raise ValueError("difficulty_control.mode must be off, adaptive, or target")
+            target = float(config.target_difficulty)
+            tolerance = float(config.tolerance)
+            if not 0.0 <= target <= 1.0 or not 0.0 < tolerance <= 1.0:
+                raise ValueError("difficulty target/tolerance must be within [0, 1]")
+            return mode, target, tolerance
+        except AttributeError:
+            return "off", 0.75, 0.10
+
+    def episode_difficulty(self):
+        """场景难度为各攻击窗口难度按有效帧数的加权平均。"""
+        if not self._episode_attack_difficulties:
+            return 0.0
+        weights = np.asarray([item["weight"] for item in self._episode_attack_difficulties], dtype=float)
+        values = np.asarray([item["difficulty"] for item in self._episode_attack_difficulties], dtype=float)
+        return float(np.average(values, weights=weights))
+
     def _read_llm_model_name(self):
-        """从统一配置读取模型名，便于在免费额度切换时只修改配置。"""
+        """环境变量优先读取模型名，便于在免费额度切换时无需改 YAML。"""
+        environment_model = os.getenv("LLM_MODEL_NAME")
+        if environment_model:
+            return environment_model
         try:
             return str(self.cfg.sim.llm.model_name)
         except AttributeError:
             return "qwen3-32b"
+
+    def _read_llm_model_names(self):
+        """读取固定候选池，避免在不同提供方之间隐式切换模型。"""
+        environment_models = os.getenv("LLM_MODEL_NAMES")
+        if environment_models:
+            return [name.strip() for name in environment_models.split(",") if name.strip()]
+        if os.getenv("LLM_MODEL_NAME"):
+            return [os.environ["LLM_MODEL_NAME"]]
+        try:
+            return list(self.cfg.sim.llm.model_names)
+        except (AttributeError, TypeError):
+            return None
+
+    def _read_llm_provider(self):
+        """环境变量优先，便于同一配置文件下安全切换提供方。"""
+        configured_provider = os.getenv("LLM_PROVIDER")
+        if configured_provider:
+            return configured_provider
+        try:
+            return str(self.cfg.sim.llm.provider)
+        except AttributeError:
+            return "dashscope"
 
     def finalize_episode_stats(self):
         """场景结束后记录本回合最小TTC"""

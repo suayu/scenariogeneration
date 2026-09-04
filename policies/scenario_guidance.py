@@ -72,6 +72,7 @@ def register_scenario_guidance():
             "contact_loss_scale": 1.0,
             "penetration_loss_scale": 5.0,
             "safety_penetration_loss_scale": 100.0,
+            "background_pair_penetration_loss_scale": 300.0,
             "max_speed": 20.0,
             "max_acceleration": 6.0,
             "max_jerk": 12.0,
@@ -122,6 +123,7 @@ def register_scenario_guidance():
                 contact_loss_scale=1.0,
                 penetration_loss_scale=5.0,
                 safety_penetration_loss_scale=100.0,
+                background_pair_penetration_loss_scale=300.0,
                 max_speed=20.0,
                 max_acceleration=6.0,
                 max_jerk=12.0,
@@ -139,6 +141,7 @@ def register_scenario_guidance():
                     contact_loss_scale,
                     penetration_loss_scale,
                     safety_penetration_loss_scale,
+                    background_pair_penetration_loss_scale,
                     kinematics_loss_scale,
                 ) < 0:
                     raise ValueError("攻击阶段帧数、接触深度和损失强度不能为负")
@@ -161,6 +164,10 @@ def register_scenario_guidance():
                 self.penetration_loss_scale = float(penetration_loss_scale)
                 self.safety_penetration_loss_scale = float(
                     safety_penetration_loss_scale
+                )
+                # 背景交通参与者之间不属于攻击目标，使用独立且更强的穿透屏障。
+                self.background_pair_penetration_loss_scale = float(
+                    background_pair_penetration_loss_scale
                 )
                 self.max_speed = float(max_speed)
                 self.max_acceleration = float(max_acceleration)
@@ -261,7 +268,8 @@ def register_scenario_guidance():
                     - pair_distance
                 )
                 pair_penalty = pair_penalty + (
-                    pair_overlap.square() * self.safety_penetration_loss_scale
+                    pair_overlap.square()
+                    * self.background_pair_penetration_loss_scale
                 )
                 identity = torch.eye(batch_size, device=world.device, dtype=torch.bool)
                 pair_penalty = pair_penalty.masked_fill(identity[:, :, None, None], 0.0)

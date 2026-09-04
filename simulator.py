@@ -96,6 +96,9 @@ class Simulator:
                 anchor_max_update=0.5 if anchor_cfg is None else anchor_cfg.max_update,
                 anchor_guide_steps=1 if anchor_cfg is None else anchor_cfg.guide_steps,
                 anchor_scale_grad_by_std=True if anchor_cfg is None else anchor_cfg.scale_grad_by_std,
+                capture_candidate_trajectories=bool(
+                    self.cfg.sim.get('visualization', {}).get('show_diffusion_candidates', False)
+                ),
             )
         elif self.traffic_backend == 'ctrl_sim':
             # 已废弃：CtRL-Sim 模型加载代码仅保留供历史参考，不再执行。
@@ -116,10 +119,21 @@ class Simulator:
 
         # 两个开销较大的控制器均随 Simulator 初始化一次，场景切换时只重置内部状态。
         llm_cfg = self.cfg.sim.get('llm')
-        llm_model_name = "qwen3-32b" if llm_cfg is None else str(llm_cfg.model_name)
-        llm_model_names = None if llm_cfg is None else list(
-            llm_cfg.get('model_names', [llm_model_name])
-        )
+        # 运行时 provider 可安全切换模型；显式环境变量必须覆盖 YAML 中其他服务的候选池。
+        environment_model_name = os.getenv('LLM_MODEL_NAME', '').strip()
+        environment_model_names = [
+            item.strip() for item in os.getenv('LLM_MODEL_NAMES', '').split(',') if item.strip()
+        ]
+        configured_model_name = "qwen3-32b" if llm_cfg is None else str(llm_cfg.model_name)
+        llm_model_name = environment_model_name or configured_model_name
+        if environment_model_names:
+            llm_model_names = environment_model_names
+        elif environment_model_name:
+            llm_model_names = [environment_model_name]
+        else:
+            llm_model_names = None if llm_cfg is None else list(
+                llm_cfg.get('model_names', [configured_model_name])
+            )
         use_multimodal = False if llm_cfg is None else bool(llm_cfg.multimodal)
         attack_mode = "trajectory_only" if llm_cfg is None else str(
             llm_cfg.get('attack_mode', 'trajectory_only')
@@ -144,6 +158,7 @@ class Simulator:
         self.activate_agent_ids = []  # 用于存储当前场景中活跃的交通参与者索引
         self.current_scene_id = None
         self.pending_joint_trajectory = None
+        self.latest_diffusion_candidate_trajectories = []
         self.attack_intent = None
         # 静态障碍物只通过统一包装器访问，避免上层规划器依赖具体仿真器 API。
         self.static_obstacle_elements = {}
@@ -357,6 +372,10 @@ class Simulator:
             self._cached_joint_trajectory = joint_trajectory
             self._cached_attack_key = attack_key
         self.inject_joint_trajectory(joint_trajectory)
+        # 候选轨迹只作为帧渲染证据，始终从联合预测元数据读取，不能影响车辆状态注入。
+        self.latest_diffusion_candidate_trajectories = joint_trajectory.metadata.get(
+            'candidate_trajectories_global', []
+        )
         return joint_trajectory
 
     def inject_joint_trajectory(self, joint_trajectory):
@@ -642,7 +661,11 @@ class Simulator:
         self.current_state = self._get_observation()
         print(" Ego State:", self.ego_state)
         # print("anchors:", anchors)
-        self._update_viz_state(anchors, refined_traj)
+        self._update_viz_state(
+            anchors,
+            refined_traj,
+            candidate_trajectories=self.latest_diffusion_candidate_trajectories,
+        )
         
         return self.current_state, terminated, info
     
@@ -696,7 +719,9 @@ class Simulator:
         return obs
 
 
-    def _update_viz_state(self, anchors=None, refined_traj=None, num_route_points=30):
+    def _update_viz_state(
+        self, anchors=None, refined_traj=None, candidate_trajectories=None, num_route_points=30
+    ):
         """ Update visualization state for current time step."""
         current_agent_states = self.data_dict['agent'][-1]
         # print("current_agent_states:", current_agent_states)
@@ -729,6 +754,13 @@ class Simulator:
             refined_traj = np.array(refined_traj)  # 確保 refined_traj 是 NumPy 數組
             refined_traj = refined_traj[:, :2]  # 提取 [x, y] 坐标
             refined_traj = normalize_route(refined_traj, normalize_dict=self.local_frame)
+        local_candidate_trajectories = []
+        for candidate in candidate_trajectories or []:
+            candidate = np.asarray(candidate, dtype=np.float32)
+            if candidate.ndim == 2 and candidate.shape[1] >= 2 and len(candidate):
+                local_candidate_trajectories.append(
+                    normalize_route(candidate[:, :2], normalize_dict=self.local_frame)
+                )
 
         # 将静态障碍物由全局坐标转换到当前自车局部坐标，仅供可视化使用。
         static_obstacles = []
@@ -757,6 +789,7 @@ class Simulator:
             'lanes_mask': lanes_mask,
             'anchors': anchors,
             'diffusion_trajectory': refined_traj,
+            'diffusion_candidate_trajectories': local_candidate_trajectories,
             'static_obstacles': static_obstacles,
         }
         # assert False
@@ -812,6 +845,7 @@ class Simulator:
         self.t = 0
         self.current_scene_id = os.path.basename(self.test_files[i])
         self.pending_joint_trajectory = None
+        self.latest_diffusion_candidate_trajectories = []
         # 缓存仅服务于显式启用的低频重规划，场景切换时必须清空。
         self._cached_joint_trajectory = None
         self._cached_attack_key = None
@@ -951,12 +985,16 @@ class Simulator:
         lanes_mask = self.viz_state['lanes_mask']
         anchors = self.viz_state['anchors']
         diffusion_trajectory = self.viz_state['diffusion_trajectory']
+        diffusion_candidate_trajectories = self.viz_state['diffusion_candidate_trajectories']
         static_obstacles = self.viz_state['static_obstacles']
         visualization_cfg = self.cfg.sim.get('visualization', {})
         # 可视化开关只控制绘图，不修改 LLM 意图或 Safe-Sim 闭环推理数据。
         show_llm_anchors = bool(visualization_cfg.get('show_llm_anchors', True))
         show_diffusion_trajectory = bool(
             visualization_cfg.get('show_diffusion_trajectory', True)
+        )
+        show_diffusion_candidates = bool(
+            visualization_cfg.get('show_diffusion_candidates', False)
         )
         
         render_state(
@@ -977,6 +1015,8 @@ class Simulator:
             static_obstacles=static_obstacles,
             show_llm_anchors=show_llm_anchors,
             show_diffusion_trajectory=show_diffusion_trajectory,
+            diffusion_candidate_trajectories=diffusion_candidate_trajectories,
+            show_diffusion_candidates=show_diffusion_candidates,
         )
 
     def save_initial_data(self, scenario_idx):
