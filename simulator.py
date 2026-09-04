@@ -101,19 +101,21 @@ class Simulator:
                 ),
             )
         elif self.traffic_backend == 'ctrl_sim':
-            # 已废弃：CtRL-Sim 模型加载代码仅保留供历史参考，不再执行。
-            # self.behaviour_model = CtRLSimBehaviourModel(
-            #     mode=self.mode,
-            #     model_path=self.cfg.sim.behaviour_model.model_path,
-            #     model=CtRLSim.load_from_checkpoint(self.cfg.sim.behaviour_model.model_path).to('cuda'),
-            #     dset=self.ctrl_sim_dset,
-            #     use_rtg=self.cfg.sim.behaviour_model.use_rtg,
-            #     predict_rtgs=self.cfg.sim.behaviour_model.predict_rtgs,
-            #     action_temperature=self.cfg.sim.behaviour_model.action_temperature,
-            #     tilt=self.cfg.sim.behaviour_model.tilt,
-            #     steps=self.steps,
-            # )
-            raise RuntimeError("CtRL-Sim 后端已废弃，请使用 safe_sim_diffusion 后端")
+            # 仅显式选择 ctrl_sim 时恢复原版 Scenario-Dreamer 背景车模型；
+            # 当前方法始终使用 safe_sim_diffusion，不会进入本分支。
+            self.behaviour_model = CtRLSimBehaviourModel(
+                mode=self.mode,
+                model_path=self.cfg.sim.behaviour_model.model_path,
+                model=CtRLSim.load_from_checkpoint(
+                    self.cfg.sim.behaviour_model.model_path
+                ).to('cuda'),
+                dset=self.ctrl_sim_dset,
+                use_rtg=self.cfg.sim.behaviour_model.use_rtg,
+                predict_rtgs=self.cfg.sim.behaviour_model.predict_rtgs,
+                action_temperature=self.cfg.sim.behaviour_model.action_temperature,
+                tilt=self.cfg.sim.behaviour_model.tilt,
+                steps=self.steps,
+            )
         elif self.traffic_backend != 'log_replay':
             raise ValueError(f"Unsupported traffic backend: {self.traffic_backend}")
 
@@ -516,21 +518,15 @@ class Simulator:
                 exists=self.agent_active,
             )
         elif self.traffic_backend == 'ctrl_sim':
-            # 已废弃：以下 CtRL-Sim 背景交通推理与单车轨迹覆盖逻辑仅保留供历史参考，不再执行。
-            # self.data_dict = self.behaviour_model.step(self.data_dict)
-            # next_states = forward_k_disks(
-            #     states=self.data_dict['agent'][-1],
-            #     actions=self.data_dict['agent_next_action'],
-            #     vocab=self.ctrl_sim_dset.V,
-            #     delta_t=self.dt,
-            #     exists=self.agent_active,
-            # )
-            # if self.adversarial_agent_id is not None and self.adversarial_traj is not None:
-            #     if self.adversarial_step_idx < len(self.adversarial_traj):
-            #         target_state = self.adversarial_traj[self.adversarial_step_idx]
-            #         next_states[self.adversarial_agent_id, 0:5] = target_state[0:5]
-            #         self.adversarial_step_idx += 1
-            raise RuntimeError("CtRL-Sim 背景交通推理已废弃，请使用 safe_sim_diffusion 后端")
+            # 原版 Scenario-Dreamer 使用 CtRL-Sim 在线预测背景车动作。
+            self.data_dict = self.behaviour_model.step(self.data_dict)
+            next_states = forward_k_disks(
+                states=self.data_dict['agent'][-1],
+                actions=self.data_dict['agent_next_action'],
+                vocab=self.ctrl_sim_dset.V,
+                delta_t=self.dt,
+                exists=self.agent_active,
+            )
         else:
             next_states = self._consume_joint_trajectory(source_step)
             # 扩散模型没有 CtRL-Sim 离散动作，使用形状兼容的占位数组供既有日志读取。
@@ -1439,10 +1435,12 @@ class CtRLSimBehaviourModel:
     def reset(self, num_agents):
         """ Reset the behaviour model state for a new scenario."""
         self.t = 0
-        self.states = np.zeros((num_agents, self.steps, self.NUM_AGENT_STATES))
+        # 冒烟测试可能短于模型的 32 帧上下文，缓冲区仍需保持训练时宽度。
+        horizon = max(self.steps, int(self.cfg_dataset.train_context_length))
+        self.states = np.zeros((num_agents, horizon, self.NUM_AGENT_STATES))
         self.types = np.zeros((num_agents, self.NUM_AGENT_TYPES))
-        self.actions = np.zeros((num_agents, self.steps))
-        self.rtgs = np.ones((num_agents, self.steps, self.cfg_model.num_reward_components)) * MAX_RTG_VAL
+        self.actions = np.zeros((num_agents, horizon))
+        self.rtgs = np.ones((num_agents, horizon, self.cfg_model.num_reward_components)) * MAX_RTG_VAL
 
     def update_state(self, data_dict):
         """ Update the internal state of the behaviour model with new data."""
