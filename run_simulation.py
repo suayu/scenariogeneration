@@ -146,6 +146,10 @@ class PolicyEvaluator:
         result = self._build_episode_result(scenario_index, info, metric_offsets)
         result.update({
             "attack_difficulty": float(attack_difficulty),
+            "attack_window_difficulties": list(
+                self.generator._episode_attack_difficulties
+            ),
+            "attack_reasons": list(self.generator._episode_attack_reasons),
             "difficulty_target": float(self.generator.target_difficulty),
             "difficulty_tolerance": float(self.generator.difficulty_tolerance),
             "replay_count": int(replay_index),
@@ -202,6 +206,22 @@ class PolicyEvaluator:
             all_metrics["mean_per_scene_danger_score"] = float(np.mean([item["scenario_danger_score"] for item in self.episode_results]))
             all_metrics["danger_weighted_complete_success"] = float(np.mean([item["scenario_danger_score"] * float(item["complete_success"]) for item in self.episode_results]))
             all_metrics["danger_weighted_partial_progress"] = float(np.mean([item["scenario_danger_score"] * item["partial_credit"] for item in self.episode_results]))
+            difficulty_errors = np.asarray([
+                item.get("difficulty_absolute_error", np.nan)
+                for item in self.episode_results
+            ], dtype=float)
+            finite_difficulty = np.isfinite(difficulty_errors)
+            all_metrics["difficulty_target_hit_rate"] = float(np.mean([
+                item.get("difficulty_control_status") == "accepted"
+                for item in self.episode_results
+            ]))
+            all_metrics["difficulty_mean_absolute_error"] = float(
+                np.mean(difficulty_errors[finite_difficulty])
+            ) if finite_difficulty.any() else float("nan")
+            all_metrics["difficulty_uncontrollable_count"] = int(sum(
+                item.get("difficulty_control_status") == "uncontrollable"
+                for item in self.episode_results
+            ))
         else:
             all_metrics["autonomous_driving_ability_score"] = 0.0
             all_metrics["evaluated_scenario_count"] = 0
