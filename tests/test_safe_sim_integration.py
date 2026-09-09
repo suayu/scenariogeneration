@@ -188,6 +188,36 @@ def test_background_pair_collision_avoidance_is_preserved_for_attacker():
     assert torch.all(loss > 100.0)
 
 
+def test_background_pair_uses_obb_boundary_instead_of_center_radius():
+    calculator = ScenarioGuidanceCalculators["scenario_collision"](
+        loss_timesteps=1,
+        safety_margin=0.0,
+        max_speed=1000.0,
+        max_acceleration=10000.0,
+        max_jerk=100000.0,
+        max_step_distance=100.0,
+    )
+    params = _scenario_collision_params(2, [0.0, 0.0], attack_age=0)
+    params["ego_extents"] = torch.tensor([[8.0, 2.0], [8.0, 2.0]])
+    # 两辆长车横向相隔 3 米，外接圆明显相交，但 OBB 占用边界仍有 1 米间隔。
+    separated = torch.zeros((2, 1, 4), dtype=torch.float32)
+    separated[0, :, 0] = 20.0
+    separated[0, :, 1] = -1.5
+    separated[1, :, 0] = 20.0
+    separated[1, :, 1] = 1.5
+    overlapping = separated.clone()
+    overlapping[1, :, 1] = -0.5
+
+    separated_loss = calculator.calculate_loss(
+        separated[..., :2], separated, params
+    )
+    overlapping_loss = calculator.calculate_loss(
+        overlapping[..., :2], overlapping, params
+    )
+
+    assert overlapping_loss.sum() > separated_loss.sum() + 100.0
+
+
 def test_late_contact_prefers_shallow_contact_and_rejects_deep_penetration():
     calculator = ScenarioGuidanceCalculators["scenario_collision"](
         loss_timesteps=1,
@@ -197,7 +227,8 @@ def test_late_contact_prefers_shallow_contact_and_rejects_deep_penetration():
         max_step_distance=100.0,
     )
     params = _scenario_collision_params(1, [1.0], attack_age=9)
-    desired_distance = float(np.sqrt(5.0) * 2.0 - 0.05)
+    # 两辆朝向一致、长度均为 4 米时，中心纵向间距 3.95 米对应 5 厘米浅接触。
+    desired_distance = 4.0 - 0.05
 
     shallow = torch.zeros((1, 1, 4), dtype=torch.float32)
     shallow[..., 0] = desired_distance
@@ -259,6 +290,40 @@ def test_collision_guidance_supports_multiple_diffusion_samples():
     assert torch.isfinite(loss).all()
     loss.sum().backward()
     assert torch.isfinite(state.grad).all()
+
+
+def test_ttc_guidance_attracts_only_targets_inside_obb_clearance_gate():
+    calculator = ScenarioGuidanceCalculators["scenario_ttc"](
+        attraction_max_clearance=20.0,
+        max_ttc=30.0,
+        loss_timesteps=2,
+        filter_timesteps=2,
+    )
+    state = torch.zeros((2, 2, 4), dtype=torch.float32, requires_grad=True)
+    transforms = torch.eye(3).repeat(2, 1, 1)
+    transforms[0, 0, 2] = 10.0
+    transforms[1, 0, 2] = 40.0
+    params = _scenario_collision_params(2, [1.0, 1.0], attack_age=0)
+    params["world_from_agent"] = transforms
+    params["guidance_target_mask"] = torch.ones(2)
+    params["scenario_ego_state"][:, 2] = 2.0
+
+    loss = calculator.calculate_loss(state[..., :2], state, params)
+
+    assert torch.all(loss[0] < 0.0)
+    torch.testing.assert_close(loss[1], torch.zeros_like(loss[1]))
+
+
+def test_scene_replay_feedback_moves_initial_stage_toward_target():
+    generator = AdversarialScenarioGenerator.__new__(AdversarialScenarioGenerator)
+    generator.difficulty_mode = "target"
+    generator.target_difficulty = 0.75
+    generator.difficulty_tolerance = 0.10
+    generator._scene_replay_stage = 1
+
+    assert generator.apply_scene_replay_feedback(0.40) == 2
+    assert generator.apply_scene_replay_feedback(0.95) == 1
+    assert generator.apply_scene_replay_feedback(0.78) == 1
 
 
 def test_wrapper_selects_one_shared_sample_from_joint_guidance_loss():

@@ -1,4 +1,6 @@
-# 基于 LLM 与扩散模型的对抗性危险场景生成
+# LLMRiskWeaver：基于 LLM 与扩散模型的可控危险场景生成
+
+**LLMRiskWeaver** 是本项目及完整方法的新名称；“Scenario Dreamer”仅用于指代所复用的上游闭环仿真器和对应原始基线，不再作为本方法名称。
 
 本分支在 Scenario Dreamer 闭环仿真器上集成了 LLM 高级攻击规划、Safe-Sim 多交通参与者联合扩散生成、静态障碍物调度和危险性评估，用于为指定自动驾驶策略生成可解释的挑战性测试场景。
 
@@ -173,7 +175,7 @@ sim.traffic_model.num_samples=5
 | `guidance.manual.functions` / `weights` / `configs` | 三项默认损失 | `manual` 模式下的严格组合。 |
 | `anchor_guidance.*` | 兼容配置 | 旧锚点接口；存在 `guidance.mode` 时以新模式为准。 |
 
-`guidance.loss_configs` 还提供逐项损失细节：`scenario_collision` 的安全边界、接触阶段、穿透屏障与速度/加速度/jerk/位移上限；`route` 的车道边界和非线性惩罚；`scenario_ttc` 的距离、时间带宽和最大 TTC。这些参数控制攻击的物理合理性与道路约束，不建议在没有回归评估时放宽。
+`guidance.loss_configs` 还提供逐项损失细节：`scenario_collision` 使用车辆 OBB 占用边界、安全边界、接触阶段、穿透屏障与速度/加速度/jerk/位移上限；`route` 使用车道边界和非线性惩罚；`scenario_ttc` 使用距离、时间带宽、最大 TTC 和当前 OBB 近场门限。背景车两两软避让与穿透屏障默认分别放大为 5 和 1000；只有当前占用边界距自车不超过 20 米的选定目标车才接受 TTC 趋近梯度。这些参数控制攻击的物理合理性与道路约束，不建议在没有回归评估时放宽。
 
 ### 闭环画像与阶段增强
 
@@ -192,6 +194,74 @@ sim.traffic_model.num_samples=5
 | `composite.ttc_scale_seconds` / `ea_scale_mps2` | `3` / `3` | TTC 与 EA 归一化尺度。 |
 | `evaluation.ea.*` | 已启用 | EA 时域、采样方向、步长、最大加速度和收敛容差。 |
 | `evaluation.reachability.*` | 已启用 | 可达集时域、网格分辨率、车道带、速度/横向速度和加速度集合。 |
+
+#### 统一危险度公式
+
+现有实现直接复用统一危险度，不另建难度定义。设有效分量集合为 \(\mathcal V\)，则：
+
+\[
+D=\frac{\sum_{j\in\mathcal V}w_j r_j}{\sum_{j\in\mathcal V}w_j}\in[0,1].
+\]
+
+默认分量及权重为：碰撞 0.30、近失 0.15、最小 TTC 0.15、最大 EA 0.12、平均 EA 0.04、最大可达性难度 0.12、平均可达性难度 0.04、无解 0.05、越界 0.01、未完成 0.01、低进度 0.01。碰撞、近失和越界直接使用零一值；未完成和低进度分别为 \(1-C\) 与 \(1-P\)。
+
+TTC、EA 与可达性归一化为：
+
+\[
+r_{TTC}=\frac{1}{1+\max(TTC,0)/3},\qquad
+r_{EA}=1-\exp(-\max(EA,0)/3),
+\]
+
+\[
+r_{reach}=1-\frac{A_{danger}}{A_{original}},\qquad
+r_{unsolvable}=1-S_{danger}.
+\]
+
+其中 EA 是在 CV/CTRV 预测和车辆 OBB 占用碰撞约束下，使未来冲突消失所需的最小二维常值相对加速度；\(A_{original}\) 和 \(A_{danger}\) 分别是同一攻击源时刻、攻击注入前后的终端可达网格面积，\(S_{danger}\) 表示危险场景是否仍存在可行终端状态。未执行可达性评估时，相应分量不会以默认零值参与加权。
+
+单场景内第 \(k\) 次攻击仍使用上述同一公式得到 \(D_k\)，场景攻击难度为按有效攻击帧数 \(n_k\) 加权的平均值：
+
+\[
+D_{scene}=\frac{\sum_k n_kD_k}{\sum_kn_k}.
+\]
+
+#### 联合扩散引导损失
+
+`llm_joint` 的总引导损失为：
+
+\[
+L=1.5L_{collision}+1.0L_{route}+2.0L_{TTC}+4.0L_{anchor}.
+\]
+
+背景车 \(i,j\) 的 OBB 有符号边界间距由分离轴定理计算：
+
+\[
+c_{ij}=\max_{a\in\mathcal A_{ij}}
+\left(|(p_j-p_i)^Ta|-r_i(a)-r_j(a)\right),
+\]
+
+其中 \(\mathcal A_{ij}\) 是两辆车的四条长短轴，\(c_{ij}<0\) 表示真实矩形占用重叠。背景车两两碰撞损失为：
+
+\[
+L_{bg}=5\,\tau\,softplus\left(\frac{m-c_{ij}}{\tau}\right)
++1000\,[\max(0,-c_{ij})]^2,
+\]
+
+默认安全边界 \(m=0.5\) 米、温度 \(\tau=0.5\)。背景车与自车使用同一 OBB 间距；非攻击车辆始终保留避让和 100 倍穿透屏障，攻击者仅按照“2 帧保护、6 帧线性放松、2 帧受控接触”调度避让权重，并始终保留最大 0.15 米穿透限制。
+
+选定近场攻击车的 TTC 风险为：
+
+\[
+R_{TTC}=\exp(-TTC/2)\exp(-d_{closest}/2)
+\mathbf 1(0<TTC\le6)\mathbf 1(c_{ego}\le20),
+\qquad L_{TTC}=-R_{TTC}.
+\]
+
+因此占用边界距自车超过 20 米的背景车不会收到趋近自车的负损失；近场且被选为目标的交通参与者才倾向于形成有限时域接近。运动学损失继续对超过 20 m/s、6 m/s²、12 m/s³ 和单帧 2 米位移的部分使用平方 ReLU 惩罚。
+
+#### 目标难度重放协议
+
+`difficulty_control.mode=target` 时，每次攻击完成后立即用统一危险度反馈下一次攻击，不预留额外“校准攻击窗口”。场景结束后检查 \(|D_{scene}-D^*|\le0.10\)；未命中时固定场景并从起点重放，根据误差方向调整初始引导阶段，最多重放 2 次。最终仍未命中时明确标记为 `uncontrollable`，不会静默伪装为达标样本。重放尝试使用独立视频目录，失败尝试不会进入正式累计指标。
 
 ## 代码入口
 

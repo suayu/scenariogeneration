@@ -8,6 +8,25 @@ from policies.obstacles import ObstacleCatalog, ObstaclePlacement
 class LLMAdversarialPlanner:
     """基于大模型的对抗性策略规划器"""
     ATTACK_MODES = {"trajectory_only", "obstacle_only", "joint"}
+    PROVIDER_ALIASES = {
+        "openai": "openai",
+        "gpt": "openai",
+        "gemini": "gemini",
+        "google": "gemini",
+        "qwen": "qwen",
+        "modelscope": "qwen",
+        "deepseek": "deepseek",
+        "dashscope": "dashscope",
+        "aliyun": "dashscope",
+        "bailian": "dashscope",
+    }
+    PROVIDER_DEFAULTS = {
+        "openai": ("OPENAI_API_KEY", "https://api.openai.com/v1"),
+        "gemini": ("GEMINI_API_KEY", "https://generativelanguage.googleapis.com/v1beta/openai/"),
+        "qwen": ("MODELSCOPE_ACCESS_TOKEN", "https://api-inference.modelscope.cn/v1"),
+        "deepseek": ("DEEPSEEK_API_KEY", "https://api.deepseek.com/v1"),
+        "dashscope": ("DASHSCOPE_API_KEY", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+    }
     FREE_MODEL_POOL = (
         "qwen3-32b",
         "qwen3.7-flash-2026-07-15",
@@ -27,9 +46,11 @@ class LLMAdversarialPlanner:
         "qwen3.5-ocr",
         # "",
     )
+    OPENAI_API_KEY = ""
 
     def __init__(self, model_name="qwen3-32b", model_names=None, client=None,
-                 use_multimodal=False, use_obstacles=False, attack_mode=None):
+                 use_multimodal=False, use_obstacles=False, attack_mode=None,
+                 provider=None, base_url=None):
         """
             LLM的输入输出全部基于局部坐标系,局部坐标系的原点为自车位置,y轴正方向为自车朝向。
             LLM类方法的输入输出全部基于全局坐标系,全局坐标系的原点为地图原点,y轴正方向为地图北方。因此需要在调用LLM前将环境状态归一化到局部坐标系,并在获取LLM输出后将其转换回全局坐标系。
@@ -58,22 +79,41 @@ class LLMAdversarialPlanner:
         # 模式优先于旧开关，避免仅障碍物模式被旧配置意外关闭。
         self.use_obstacles = self.attack_mode in {"obstacle_only", "joint"}
         self.obstacle_catalog = ObstacleCatalog()
+        # 提供方仅控制鉴权变量、端点和 API 契约；模型候选池仍由调用方显式配置。
+        requested_provider = str(provider or os.getenv("LLM_PROVIDER", "dashscope")).lower()
+        self.provider = self.PROVIDER_ALIASES.get(requested_provider)
+        if self.provider is None:
+            supported = ", ".join(sorted(self.PROVIDER_DEFAULTS))
+            raise ValueError(f"不支持的 LLM 提供方：{requested_provider}，可选值为：{supported}")
+        self.api_key_env, default_base_url = self.PROVIDER_DEFAULTS[self.provider]
+        self.base_url = (
+            base_url
+            or os.getenv(f"{self.provider.upper()}_BASE_URL")
+            or (os.getenv("LLM_BASE_URL") if self.provider == "dashscope" else None)
+            or default_base_url
+        )
+        self.openai_reasoning_effort = os.getenv("OPENAI_REASONING_EFFORT", "low")
 
-        api_key = os.getenv("LLM_API_KEY","sk-ws-H.EDIRXYI.CIQJ.MEQCIEMNMXNJhnr1bIUzENhRdivO3EEcLzTP8YnG21XC2MctAiAOi080BKTRkI7Wjn_sSJACVvlIOdrUHbvExwrO3Pu-DQ") or os.getenv("API_KEY","sk-ws-H.EDIRXYI.CIQJ.MEQCIEMNMXNJhnr1bIUzENhRdivO3EEcLzTP8YnG21XC2MctAiAOi080BKTRkI7Wjn_sSJACVvlIOdrUHbvExwrO3Pu-DQ")
+        api_key = os.getenv("LLM_API_KEY") or os.getenv("API_KEY")
+        # 新提供方绝不回退到旧百炼兼容密钥，防止把错误凭据发送给其他服务。
+        if self.provider != "dashscope":
+            api_key = os.getenv(self.api_key_env)
+        else:
+            api_key = os.getenv(self.api_key_env) or api_key
         if client is not None:
             self.client = client
             self.available = True
         elif api_key:
             self.client = OpenAI(
                 api_key=api_key,
-                base_url=os.getenv("LLM_BASE_URL", "https://ws-qvq9xoxtkn7fpem7.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"),
+                base_url=self.base_url,
             )
             self.available = True
         else:
             self.client = None
             self.available = False
-            self.last_error = "服务器未设置 LLM_API_KEY 或 API_KEY"
-            print("[大模型规划器] 未设置 LLM_API_KEY 或 API_KEY,本次运行将停用高级攻击规划,但仿真会继续。")
+            self.last_error = f"服务器未设置 {self.api_key_env}"
+            print(f"[大模型规划器] 未设置 {self.api_key_env},本次运行将停用高级攻击规划,但仿真会继续。")
         self._use_local_coordinate = True  # 是否将环境状态归一化到以自车为中心的局部坐标系
 
     def _normalize_env_state(self, env_state_json):
@@ -612,6 +652,27 @@ Current scene state:
 
     def _request_attack_plan_once(self, model_name, prompt, scene_image=None):
         """使用单个指定模型执行一次纯文本或多模态请求。"""
+        if self.provider == "openai":
+            # GPT-5.6 使用官方 Responses API，避免依赖兼容层的非标准字段。
+            content = [{"type": "input_text", "text": prompt}]
+            if self.use_multimodal:
+                if scene_image is None:
+                    raise ValueError("多模态模式已开启，但未提供当前帧渲染")
+                content.append({
+                    "type": "input_image",
+                    "image_url": self._image_data_url(scene_image),
+                })
+            response = self.client.responses.create(
+                model=model_name,
+                input=[{"role": "user", "content": content}],
+                reasoning={"effort": self.openai_reasoning_effort},
+            )
+            raw = getattr(response, "output_text", None)
+            try:
+                return "", self._parse_json_object(raw)
+            except (TypeError, json.JSONDecodeError) as error:
+                raise ValueError(f"无法将 OpenAI Responses 输出解析为 JSON：{raw}") from error
+
         if self.use_multimodal:
             if scene_image is None:
                 raise ValueError("多模态模式已开启，但未提供当前帧渲染")
@@ -637,12 +698,21 @@ Current scene state:
             except (TypeError, json.JSONDecodeError) as e:
                 raise ValueError(f"无法将多模态大模型输出解析为 JSON：{raw}") from e
 
-        response = self.client.responses.create(
-            model=model_name,
-            input=prompt,
-            extra_body={"enable_thinking": False},
-        )
-        return self._extract_reasoning_and_result(response)
+        # 部分 OpenAI 兼容服务只接受 Chat Completions；纯文本与多模态共用该契约。
+        request_kwargs = {
+            "model": model_name,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        # 百炼和 ModelScope 的 Qwen 兼容接口支持关闭思考，以稳定输出 JSON 计划。
+        if self.provider in {"dashscope", "qwen"}:
+            request_kwargs["extra_body"] = {"enable_thinking": False}
+        response = self.client.chat.completions.create(**request_kwargs)
+        message = response.choices[0].message
+        reasoning = getattr(message, "reasoning_content", "") or ""
+        try:
+            return reasoning, self._parse_json_object(message.content)
+        except (TypeError, json.JSONDecodeError) as error:
+            raise ValueError(f"无法将纯文本大模型输出解析为 JSON：{message.content}") from error
 
     def _request_attack_plan(self, prompt, scene_image=None):
         """按候选池轮换模型，服务、额度或模型可用性失败时自动切换。"""

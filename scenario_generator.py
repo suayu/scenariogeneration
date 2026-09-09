@@ -82,6 +82,8 @@ class AdversarialScenarioGenerator:
         self._profile_previous = None
         self._recent_attack_context = None
         self._recent_attack_expired_step = None
+        self._iterative_window_metric_offsets = None
+        self._scene_replay_stage = 0
 
     def step(self, env, current_t):
         """在仿真主循环中调用，控制低频决策与轨迹注入"""
@@ -225,6 +227,10 @@ class AdversarialScenarioGenerator:
         self.diffusion_trajectory = None
         env.set_attack_intent(target_id=target_id, anchors=anchors, strategy=strategy)
         self._episode_attack_plan_count += 1
+        self._iterative_window_metric_offsets = {
+            "ea": len(self.risk_metrics.ea_values),
+            "reachability": len(self.risk_metrics.reachability_events),
+        }
         # 当前有效计划对应本轮刚记录的最后一个攻击原因。
         if self._episode_attack_reasons:
             self._episode_attack_reasons[-1]["accepted"] = True
@@ -282,15 +288,16 @@ class AdversarialScenarioGenerator:
         """在 Safe-Sim 已生成本帧联合轨迹后，计算攻击后可达集。"""
         return self.risk_metrics.evaluate_dangerous_reachability(env)
 
-    def reset_episode_stats(self):
-        """每个场景开始前重置单回合统计"""
+    def reset_episode_stats(self, advance_instruction=True):
+        """重置单回合统计；同一场景重放时保持自然语言指令不变。"""
         self._current_episode_min_ttc = float('inf')
         self._episode_attack_plan_count = 0
         self._episode_attack_active_frames = 0
         self._episode_obstacle_plan_count = 0
         self._episode_attack_reasons = []
         self._episode_attack_difficulties = []
-        self._advance_scene_instruction()
+        if advance_instruction:
+            self._advance_scene_instruction()
         self._llm_call_times = 0
         self._attacks_enabled = bool(getattr(self.llm_planner, "available", True))
         self._consecutive_llm_failures = 0
@@ -299,9 +306,11 @@ class AdversarialScenarioGenerator:
         self.llm_anchors = None
         self.diffusion_trajectory = None
         self.risk_metrics.reset_episode()
-        if self.profile_enabled or self.escalation_enabled:
-            self._iterative_stage, self._iterative_window, self._iterative_context = 0, [], None
+        if self.profile_enabled or self.escalation_enabled or self.difficulty_mode != "off":
+            self._iterative_stage = int(self._scene_replay_stage)
+            self._iterative_window, self._iterative_context = [], None
             self._profile_previous = None
+        self._iterative_window_metric_offsets = None
         self._recent_attack_context = None
         self._recent_attack_expired_step = None
 
@@ -365,12 +374,36 @@ class AdversarialScenarioGenerator:
             "peak_brake_mps2": float(peak_brake), "peak_jerk_mps3": float(peak_jerk),
             "peak_yaw_rate_rps": float(peak_turn), "max_route_error_m": float(max(route_errors)) if route_errors else None,
             "preferred_exploit": exploit}
+        offsets = self._iterative_window_metric_offsets or {
+            "ea": len(self.risk_metrics.ea_values),
+            "reachability": len(self.risk_metrics.reachability_events),
+        }
+        ea_values = self.risk_metrics.ea_values[offsets["ea"]:]
+        reachability_events = self.risk_metrics.reachability_events[
+            offsets["reachability"]:
+        ]
+        finite_events = [
+            event
+            for event in reachability_events
+            if np.isfinite(event["difficulty"])
+        ]
         window_metrics = {
             "collision_rate": float(collision),
             "near_miss_rate": float(np.mean([x["near_miss"] for x in data])),
             "avg_min_ttc": float(min_ttc),
-            **self.risk_metrics.compute_metrics(),
+            "max_evasive_acceleration_mps2": float(max(ea_values)) if ea_values else 0.0,
+            "mean_evasive_acceleration_mps2": float(np.mean(ea_values)) if ea_values else 0.0,
+            "reachability_event_count": len(reachability_events),
         }
+        if finite_events:
+            hardest = max(finite_events, key=lambda event: event["difficulty"])
+            window_metrics.update({
+                "reachability_difficulty": float(hardest["difficulty"]),
+                "mean_reachability_difficulty": float(np.mean([
+                    event["difficulty"] for event in finite_events
+                ])),
+                "dangerous_scene_solvable": float(hardest["dangerous_solvable"]),
+            })
         observed_difficulty = compute_scenario_danger_score(window_metrics, self.cfg.sim.evaluation.composite)
         self._episode_attack_difficulties.append({"difficulty": float(observed_difficulty), "weight": int(len(data)), "stage": int(self._iterative_stage)})
         self._iterative_context["observed_difficulty"] = float(observed_difficulty)
@@ -400,6 +433,7 @@ class AdversarialScenarioGenerator:
         elif self.escalation_enabled and not collision:
             self._iterative_stage = min(self._iterative_stage + 1, len(_ITERATIVE_STAGES) - 1)
         self._iterative_window = []
+        self._iterative_window_metric_offsets = None
 
     def _policy_memory(self):
         key = str(getattr(getattr(self.cfg, "sim", None), "policy", "unknown"))
@@ -450,6 +484,29 @@ class AdversarialScenarioGenerator:
         weights = np.asarray([item["weight"] for item in self._episode_attack_difficulties], dtype=float)
         values = np.asarray([item["difficulty"] for item in self._episode_attack_difficulties], dtype=float)
         return float(np.average(values, weights=weights))
+
+    def finalize_episode_difficulty(self):
+        """场景提前终止时也结算最后一个攻击窗口，不额外创建校准攻击。"""
+        if self._iterative_window:
+            self._finish_iterative_window()
+        return self.episode_difficulty()
+
+    def apply_scene_replay_feedback(self, observed_difficulty):
+        """根据场景最终难度调整下一次完整重放的初始引导阶段。"""
+        if self.difficulty_mode != "target":
+            return self._scene_replay_stage
+        observed_difficulty = float(observed_difficulty)
+        if observed_difficulty < self.target_difficulty - self.difficulty_tolerance:
+            self._scene_replay_stage = min(
+                self._scene_replay_stage + 1, len(_ITERATIVE_STAGES) - 1
+            )
+        elif observed_difficulty > self.target_difficulty + self.difficulty_tolerance:
+            self._scene_replay_stage = max(self._scene_replay_stage - 1, 0)
+        return self._scene_replay_stage
+
+    def reset_scene_replay_control(self):
+        """进入新场景前清除上一场景的重放强度偏置。"""
+        self._scene_replay_stage = 0
 
     def _read_llm_model_name(self):
         """环境变量优先读取模型名，便于在免费额度切换时无需改 YAML。"""

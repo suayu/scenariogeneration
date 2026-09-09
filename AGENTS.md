@@ -1,4 +1,6 @@
-# Scenario-Dreamer 项目工作协议
+# LLMRiskWeaver 项目工作协议
+
+- 项目及完整危险场景生成方法统一称为 **LLMRiskWeaver**；Scenario Dreamer 仅表示上游仿真器或原始对比基线。
 
 ## 实验与安全
 

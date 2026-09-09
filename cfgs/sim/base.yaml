@@ -89,7 +89,8 @@ traffic_model:
         contact_loss_scale: 1.0 # 末段受控接触损失强度
         penetration_loss_scale: 5.0 # 深度穿透惩罚强度
         safety_penetration_loss_scale: 100.0 # 背景车互撞和非攻击车撞自车的强穿透屏障
-        background_pair_penetration_loss_scale: 300.0 # 背景交通参与者之间的独立强穿透屏障，避免非目标交通互撞
+        background_pair_penetration_loss_scale: 1000.0 # 基于 OBB 穿透深度的强屏障，避免非目标交通互撞
+        background_pair_safety_loss_scale: 5.0 # 基于 OBB 占用边界的提前避让损失强度
         max_speed: 20.0 # 所有背景车辆允许的最大速度，单位为米每秒
         max_acceleration: 6.0 # 所有背景车辆允许的最大加速度模长，单位为米每二次方秒
         max_jerk: 12.0 # 所有背景车辆允许的最大加加速度模长，单位为米每三次方秒
@@ -106,6 +107,7 @@ traffic_model:
         time_bandwidth: 2.0
         min_velocity_diff: 0.1
         max_ttc: 6.0
+        attraction_max_clearance: 20.0 # 仅占用边界距自车不超过该值的目标车接受 TTC 趋近引导
         loss_timesteps: 20
         filter_timesteps: 20
         loss_scale: 1.0
@@ -145,6 +147,7 @@ evaluation:
     mode: "off"
     target_difficulty: 0.75
     tolerance: 0.10
+    max_replays: 2 # 初次生成未命中目标区间时，最多从场景起点完整重放两次
     ability_progress_alpha: 0.15
   composite:
     # 各项先归一化到零到一，再按有效权重重新归一化并求加权平均。

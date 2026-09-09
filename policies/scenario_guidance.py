@@ -72,7 +72,8 @@ def register_scenario_guidance():
             "contact_loss_scale": 1.0,
             "penetration_loss_scale": 5.0,
             "safety_penetration_loss_scale": 100.0,
-            "background_pair_penetration_loss_scale": 300.0,
+            "background_pair_penetration_loss_scale": 1000.0,
+            "background_pair_safety_loss_scale": 5.0,
             "max_speed": 20.0,
             "max_acceleration": 6.0,
             "max_jerk": 12.0,
@@ -84,6 +85,7 @@ def register_scenario_guidance():
             "time_bandwidth": 2.0,
             "min_velocity_diff": 0.1,
             "max_ttc": 6.0,
+            "attraction_max_clearance": 20.0,
             "loss_timesteps": 20,
             "filter_timesteps": 20,
             "loss_scale": 1.0,
@@ -102,6 +104,58 @@ def register_scenario_guidance():
         ego_state = ego_state[0].to(device=device, dtype=dtype)
         times = torch.arange(1, horizon + 1, device=device, dtype=dtype) * float(params["dt"])
         return ego_state[None, :2] + times[:, None] * ego_state[None, 2:4]
+
+    def _obb_signed_clearance(
+        center_a,
+        yaw_a,
+        extent_a,
+        center_b,
+        yaw_b,
+        extent_b,
+    ):
+        """返回二维 OBB 的有符号占用边界间距；负值表示矩形发生重叠。"""
+        center_a, center_b = torch.broadcast_tensors(center_a, center_b)
+        yaw_a, yaw_b = torch.broadcast_tensors(yaw_a, yaw_b)
+        extent_a = torch.broadcast_to(extent_a, center_a.shape)
+        extent_b = torch.broadcast_to(extent_b, center_b.shape)
+        axes_a = torch.stack(
+            (
+                torch.stack((torch.cos(yaw_a), torch.sin(yaw_a)), dim=-1),
+                torch.stack((-torch.sin(yaw_a), torch.cos(yaw_a)), dim=-1),
+            ),
+            dim=-2,
+        )
+        axes_b = torch.stack(
+            (
+                torch.stack((torch.cos(yaw_b), torch.sin(yaw_b)), dim=-1),
+                torch.stack((-torch.sin(yaw_b), torch.cos(yaw_b)), dim=-1),
+            ),
+            dim=-2,
+        )
+        separating_axes = torch.cat((axes_a, axes_b), dim=-2)
+        relative_center = center_b - center_a
+        center_projection = torch.abs(
+            torch.sum(relative_center[..., None, :] * separating_axes, dim=-1)
+        )
+
+        def projected_radius(box_axes, box_extent):
+            # 将车辆的长、宽半轴投影到四条分离轴，得到真实矩形占用边界。
+            alignment = torch.abs(
+                torch.sum(
+                    separating_axes[..., :, None, :]
+                    * box_axes[..., None, :, :],
+                    dim=-1,
+                )
+            )
+            return torch.sum(alignment * (0.5 * box_extent[..., None, :]), dim=-1)
+
+        axis_clearance = (
+            center_projection
+            - projected_radius(axes_a, extent_a)
+            - projected_radius(axes_b, extent_b)
+        )
+        # SAT 中任意轴分离即可判定不重叠；最大间距同时给出可微的近似穿透深度。
+        return torch.amax(axis_clearance, dim=-1)
 
     if "scenario_collision" not in GUIDANCE_REGISTRY:
         @register_guidance("scenario_collision")
@@ -123,7 +177,8 @@ def register_scenario_guidance():
                 contact_loss_scale=1.0,
                 penetration_loss_scale=5.0,
                 safety_penetration_loss_scale=100.0,
-                background_pair_penetration_loss_scale=300.0,
+                background_pair_penetration_loss_scale=1000.0,
+                background_pair_safety_loss_scale=5.0,
                 max_speed=20.0,
                 max_acceleration=6.0,
                 max_jerk=12.0,
@@ -142,6 +197,7 @@ def register_scenario_guidance():
                     penetration_loss_scale,
                     safety_penetration_loss_scale,
                     background_pair_penetration_loss_scale,
+                    background_pair_safety_loss_scale,
                     kinematics_loss_scale,
                 ) < 0:
                     raise ValueError("攻击阶段帧数、接触深度和损失强度不能为负")
@@ -168,6 +224,9 @@ def register_scenario_guidance():
                 # 背景交通参与者之间不属于攻击目标，使用独立且更强的穿透屏障。
                 self.background_pair_penetration_loss_scale = float(
                     background_pair_penetration_loss_scale
+                )
+                self.background_pair_safety_loss_scale = float(
+                    background_pair_safety_loss_scale
                 )
                 self.max_speed = float(max_speed)
                 self.max_acceleration = float(max_acceleration)
@@ -250,23 +309,39 @@ def register_scenario_guidance():
                 world = _world_positions(state, params).reshape(
                     batch_size, num_samples, horizon, 2
                 )
-                extents = params["ego_extents"].to(world).clamp_min(0.1)
-                radii = 0.5 * torch.linalg.norm(extents, dim=-1)
+                configured_extents = params.get("ego_extents")
+                if configured_extents is None:
+                    configured_extents = world.new_tensor([4.5, 2.0]).repeat(
+                        batch_size, 1
+                    )
+                extents = configured_extents.to(world).clamp_min(0.1)
+                local_yaw = state[..., 2].reshape(
+                    batch_size, num_samples, horizon
+                )
+                configured_yaw = params.get("yaw")
+                if configured_yaw is None:
+                    transforms = params["world_from_agent"].to(world)
+                    configured_yaw = torch.atan2(
+                        transforms[:, 1, 0], transforms[:, 0, 0]
+                    )
+                initial_yaw = enlarge_batch_samples(
+                    configured_yaw.to(world), batch_size, num_samples
+                ).reshape(batch_size, num_samples)
+                world_yaw = local_yaw + initial_yaw[:, :, None]
 
-                pair_distance = torch.linalg.norm(
-                    world[:, None] - world[None, :], dim=-1
+                pair_clearance = _obb_signed_clearance(
+                    world[:, None],
+                    world_yaw[:, None],
+                    extents[:, None, None, None, :],
+                    world[None, :],
+                    world_yaw[None, :],
+                    extents[None, :, None, None, :],
                 )
-                pair_margin = radii[:, None, None, None] + radii[None, :, None, None]
-                pair_margin = pair_margin + self.safety_margin
                 pair_penalty = F.softplus(
-                    (pair_margin - pair_distance) / self.temperature
-                ) * self.temperature
-                # 软安全边界负责提前避让，二次穿透屏障负责强烈排斥已经重叠的背景车。
-                pair_overlap = F.relu(
-                    radii[:, None, None, None]
-                    + radii[None, :, None, None]
-                    - pair_distance
-                )
+                    (self.safety_margin - pair_clearance) / self.temperature
+                ) * self.temperature * self.background_pair_safety_loss_scale
+                # 软边界提前避让；基于 OBB 穿透深度的二次屏障强烈排斥真实占用重叠。
+                pair_overlap = F.relu(-pair_clearance)
                 pair_penalty = pair_penalty + (
                     pair_overlap.square()
                     * self.background_pair_penetration_loss_scale
@@ -277,11 +352,17 @@ def register_scenario_guidance():
 
                 ego_future = _ego_future(params, horizon, world.dtype, world.device)
                 ego_extent = params["scenario_ego_state"][0, 5:7].to(world).clamp_min(0.1)
-                ego_radius = 0.5 * torch.linalg.norm(ego_extent)
-                ego_distance = torch.linalg.norm(world - ego_future[None, None], dim=-1)
-                ego_margin = radii[:, None, None] + ego_radius + self.safety_margin
+                ego_yaw = params["scenario_ego_state"][0, 4].to(world)
+                ego_clearance = _obb_signed_clearance(
+                    world,
+                    world_yaw,
+                    extents[:, None, None, :],
+                    ego_future[None, None],
+                    ego_yaw.reshape(1, 1, 1),
+                    ego_extent.reshape(1, 1, 1, 2),
+                )
                 ego_avoidance = F.softplus(
-                    (ego_margin - ego_distance) / self.temperature
+                    (self.safety_margin - ego_clearance) / self.temperature
                 ) * self.temperature
 
                 # 非攻击车辆始终避让自车；只有 LLM 明确指定的攻击者进入分阶段调度。
@@ -326,9 +407,7 @@ def register_scenario_guidance():
                 loss = loss + ego_avoidance * avoidance_weight
 
                 # 非攻击车辆始终使用强穿透屏障；攻击者只按当前避碰阶段等比例减弱。
-                ego_overlap = F.relu(
-                    radii[:, None, None] + ego_radius - ego_distance
-                ).square()
+                ego_overlap = F.relu(-ego_clearance).square()
                 loss = loss + (
                     ego_overlap
                     * avoidance_weight
@@ -336,12 +415,9 @@ def register_scenario_guidance():
                 )
 
                 # 即使进入接触阶段也禁止深度穿透；该项只约束攻击者，不改变其他车辆的安全逻辑。
-                hard_min_distance = (
-                    radii[:, None, None]
-                    + ego_radius
-                    - self.max_contact_penetration
-                ).clamp_min(0.0)
-                penetration_loss = F.relu(hard_min_distance - ego_distance).square()
+                penetration_loss = F.relu(
+                    -ego_clearance - self.max_contact_penetration
+                ).square()
                 loss = loss + (
                     penetration_loss
                     * attack_mask[:, :, None]
@@ -350,12 +426,11 @@ def register_scenario_guidance():
 
                 if schedule["contact_weight"] > 0.0:
                     contact_step = min(int(schedule["contact_step"]), horizon - 1)
-                    desired_distance = (
-                        radii[:, None]
-                        + ego_radius
-                        - self.controlled_contact_penetration
-                    ).clamp_min(0.0)
-                    contact_error = ego_distance[:, :, contact_step] - desired_distance
+                    # 受控接触直接约束 OBB 边界间距，而不是车辆中心距离。
+                    contact_error = (
+                        ego_clearance[:, :, contact_step]
+                        + self.controlled_contact_penetration
+                    )
                     contact_loss = F.smooth_l1_loss(
                         contact_error,
                         torch.zeros_like(contact_error),
@@ -382,8 +457,9 @@ def register_scenario_guidance():
                         world[:, :, :, None, :] - obstacles[:, :, None, :, :2],
                         dim=-1,
                     )
+                    vehicle_radii = 0.5 * torch.linalg.norm(extents, dim=-1)
                     obstacle_margin = (
-                        radii[:, None, None, None]
+                        vehicle_radii[:, None, None, None]
                         + obstacle_radii[:, :, None, :]
                         + self.safety_margin
                     )
@@ -391,7 +467,8 @@ def register_scenario_guidance():
                         (obstacle_margin - obstacle_distance) / self.temperature
                     ) * self.temperature
                     obstacle_overlap = F.relu(
-                        radii[:, None, None, None] + obstacle_radii[:, :, None, :]
+                        vehicle_radii[:, None, None, None]
+                        + obstacle_radii[:, :, None, :]
                         - obstacle_distance
                     )
                     obstacle_penalty = obstacle_penalty + (
@@ -421,17 +498,25 @@ def register_scenario_guidance():
                 time_bandwidth=2.0,
                 min_velocity_diff=0.1,
                 max_ttc=6.0,
+                attraction_max_clearance=20.0,
                 loss_timesteps=20,
                 filter_timesteps=20,
                 loss_scale=1.0,
             ):
                 super().__init__(loss_timesteps, filter_timesteps, loss_scale)
-                if min(distance_bandwidth, time_bandwidth, min_velocity_diff, max_ttc) <= 0:
+                if min(
+                    distance_bandwidth,
+                    time_bandwidth,
+                    min_velocity_diff,
+                    max_ttc,
+                    attraction_max_clearance,
+                ) <= 0:
                     raise ValueError("TTC 损失带宽、速度阈值和最大 TTC 必须为正")
                 self.distance_bandwidth = float(distance_bandwidth)
                 self.time_bandwidth = float(time_bandwidth)
                 self.min_velocity_diff = float(min_velocity_diff)
                 self.max_ttc = float(max_ttc)
+                self.attraction_max_clearance = float(attraction_max_clearance)
 
             def update_params(self, params: Dict[str, torch.Tensor]) -> None:
                 pass
@@ -465,6 +550,37 @@ def register_scenario_guidance():
                 valid = (ttc > 0.0) & (ttc <= self.max_ttc)
                 risk = torch.exp(-ttc.clamp_min(0.0) / self.time_bandwidth)
                 risk = risk * torch.exp(-closest_distance / self.distance_bandwidth) * valid
+
+                # 仅允许当前占用边界已进入近场的车辆接受趋近梯度；远车严格为零。
+                configured_extents = params.get("ego_extents")
+                if configured_extents is None:
+                    configured_extents = world.new_tensor([4.5, 2.0]).repeat(
+                        batch_size, 1
+                    )
+                extents = configured_extents.to(world).clamp_min(0.1)
+                initial_position = params["world_from_agent"][:, :2, -1].reshape(
+                    batch_size, num_samples, 2
+                )
+                configured_yaw = params.get("yaw")
+                if configured_yaw is None:
+                    transforms = params["world_from_agent"].to(world)
+                    configured_yaw = torch.atan2(
+                        transforms[:, 1, 0], transforms[:, 0, 0]
+                    )
+                initial_yaw = enlarge_batch_samples(
+                    configured_yaw.to(world), batch_size, num_samples
+                ).reshape(batch_size, num_samples)
+                ego_state = params["scenario_ego_state"][0].to(world)
+                initial_clearance = _obb_signed_clearance(
+                    initial_position,
+                    initial_yaw,
+                    extents[:, None, :],
+                    ego_state[:2].reshape(1, 1, 2),
+                    ego_state[4].reshape(1, 1),
+                    ego_state[5:7].reshape(1, 1, 2),
+                )
+                near_ego = initial_clearance <= self.attraction_max_clearance
+                risk = risk * near_ego[:, :, None].to(risk.dtype)
 
                 target_mask = params.get("guidance_target_mask")
                 if target_mask is not None:

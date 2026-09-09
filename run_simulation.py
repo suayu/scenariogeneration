@@ -95,6 +95,72 @@ class PolicyEvaluator:
         partial_credit = 0.0 if complete else coefficient * metrics["progress"]
         return {"scenario_index": int(scenario_index), "scenario_danger_score": float(danger), "complete_success": complete, "progress": metrics["progress"], "partial_progress_coefficient": coefficient, "partial_credit": float(partial_credit), "autonomous_driving_ability_score": float(100.0 * danger * (float(complete) + partial_credit)), "collision": bool(metrics["collision rate"]), "off_route": bool(metrics["off route rate"]), "completed": bool(metrics["completed rate"]), "attack_plan_count": int(self.generator._episode_attack_plan_count), "attack_active_frames": int(self.generator._episode_attack_active_frames), "obstacle_plan_count": int(self.generator._episode_obstacle_plan_count), "video_path": str(Path(str(self.cfg.movie_path)) / f"scenario_{scenario_index:03d}" / f"scenario_{scenario_index:03d}.mp4")}
 
+    def _rollback_attempt_metrics(self, offsets):
+        """目标难度重放前撤销失败尝试的累计统计，避免重复计权。"""
+        del self.generator.collision_list[offsets["collision"]:]
+        del self.generator.near_miss_list[offsets["near_miss"]:]
+        del self.generator.ttc_list[offsets["ttc"]:]
+        del self.generator.risk_metrics.ea_values[offsets["ea"]:]
+        del self.generator.risk_metrics.reachability_events[offsets["reachability"]:]
+
+    def _run_scenario_attempt(self, scenario_index, replay_index, target_mode):
+        """从场景起点执行一次完整闭环；重放不增加额外校准攻击窗口。"""
+        obs = self.env.reset(scenario_index)
+        metric_offsets = self._metric_offsets()
+        self.generator.reset_episode_stats(advance_instruction=replay_index == 0)
+        if hasattr(self.policy, 'reset'):
+            self.policy.reset(obs)
+
+        scenario_movie_dir = Path(str(self.cfg.movie_path)) / f"scenario_{scenario_index:03d}"
+        if target_mode:
+            # 每次重放单独保存，防止提前终止尝试遗留的帧混入最终视频。
+            scenario_movie_dir = scenario_movie_dir / f"attempt_{replay_index}"
+
+        info = {"collision": False, "off_route": False, "completed": False, "progress": 0.0}
+        for _ in range(self.env.steps):
+            current_t = self.env.current_step
+            self.generator.step(self.env, current_t)
+            self.env.prepare_background_traffic()
+            self.generator.evaluate_reachability(self.env)
+            self.generator.set_diffusion_trajectory(
+                self.env.get_attack_target_prediction()
+            )
+            anchors, refined_traj = self.generator.get_anchors_and_trajectory()
+
+            if self.cfg.visualize:
+                self.env.render_state(
+                    name=f'scenario_{scenario_index:03d}',
+                    movie_path=str(scenario_movie_dir),
+                )
+
+            action = self.policy.act(obs)
+            obs, terminated, info = self.env.step(action, anchors, refined_traj)
+            self.generator.evaluate_reaction(self.env, info)
+            if terminated:
+                self.env.dump_step_data(scenario_index)
+                break
+            print("step:", current_t, " of ", self.env.steps)
+
+        self.generator.finalize_episode_stats()
+        attack_difficulty = self.generator.finalize_episode_difficulty()
+        result = self._build_episode_result(scenario_index, info, metric_offsets)
+        result.update({
+            "attack_difficulty": float(attack_difficulty),
+            "difficulty_target": float(self.generator.target_difficulty),
+            "difficulty_tolerance": float(self.generator.difficulty_tolerance),
+            "replay_count": int(replay_index),
+        })
+        if self.cfg.visualize:
+            video_path = generate_video(
+                name=f'scenario_{scenario_index:03d}',
+                output_dir=str(scenario_movie_dir),
+                delete_images=False,
+            )
+            result["video_path"] = str(video_path or (
+                scenario_movie_dir / f"scenario_{scenario_index:03d}.mp4"
+            ))
+        return info, metric_offsets, result, attack_difficulty
+
     def _write_multi_scenario_results(self, all_metrics):
         """输出逐场景 JSON、CSV 与汇总图，供多场景模型能力对比使用。"""
         if not self.episode_results:
@@ -149,65 +215,36 @@ class PolicyEvaluator:
         # 遍历所有测试场景
         max_scenarios = int(getattr(getattr(self.cfg, "evaluation", None), "max_scenarios", 0))
         scenario_count = self.env.num_test_scenarios if max_scenarios <= 0 else min(max_scenarios, self.env.num_test_scenarios)
+        difficulty_cfg = getattr(getattr(self.cfg, "evaluation", None), "difficulty_control", None)
+        target_mode = str(getattr(difficulty_cfg, "mode", "off")).lower() == "target"
+        max_replays = max(0, int(getattr(difficulty_cfg, "max_replays", 2)))
         for i in tqdm(range(scenario_count)):
             print(f"Simulating environment {i}")
-            obs = self.env.reset(i)
-
-            # 记录累计指标边界；后续只使用本场景产生的数据计算独立得分。
-            metric_offsets = self._metric_offsets()
-            # 重置单回合对抗统计
-            self.generator.reset_episode_stats()
-
-            if hasattr(self.policy, 'reset'):
-                self.policy.reset(obs)
-
-            # 在单个场景中执行固定步数的交互
-            for _ in range(self.env.steps):
-                current_t = self.env.current_step
-                # 1. 调用生成器：低频触发大模型规划与轨迹注入
-                self.generator.step(self.env, current_t)
-
-                # 2. Safe-Sim 先基于当前快照预测所有受控非自车参与者；Simulator.step 仅执行第一帧。
-                self.env.prepare_background_traffic()
-                # 必须在联合轨迹已准备但尚未执行时，与攻击前同源帧可达集对比。
-                self.generator.evaluate_reachability(self.env)
-                self.generator.set_diffusion_trajectory(
-                    self.env.get_attack_target_prediction()
+            self.generator.reset_scene_replay_control()
+            for replay_index in range(max_replays + 1 if target_mode else 1):
+                info, metric_offsets, result, difficulty = self._run_scenario_attempt(
+                    i, replay_index, target_mode
                 )
-                anchors, refined_traj = self.generator.get_anchors_and_trajectory()
-
-                if self.cfg.visualize:
-                    # render_frame = True
-                    # if self.cfg.lightweight:
-                    #     if t%3 != 0:
-                    #         render_frame = False
-                    # observations always rendered in local frame of agent
-                    # if render_frame:
-                    # 每个场景独立目录，防止视频合成时混入其它场景的 PNG 帧。
-                    scenario_movie_dir = os.path.join(str(self.cfg.movie_path), f"scenario_{i:03d}")
-                    self.env.render_state(name=f'scenario_{i:03d}', movie_path=scenario_movie_dir)
-                
-                # 3. 自车决策与环境步进
-                action = self.policy.act(obs)
-                obs, terminated, info = self.env.step(action, anchors, refined_traj)
-
-                # 4. 采集原有碰撞/TTC指标和新增的二维 EA。
-                self.generator.evaluate_reaction(self.env, info)
-
-                if terminated:
-                    self.env.dump_step_data(i)
+                target_error = abs(difficulty - self.generator.target_difficulty)
+                accepted = not target_mode or target_error <= self.generator.difficulty_tolerance
+                exhausted = replay_index >= max_replays
+                if accepted or exhausted:
+                    result["difficulty_control_status"] = (
+                        "accepted" if accepted else "uncontrollable"
+                    )
+                    result["difficulty_absolute_error"] = float(target_error)
+                    self.update_running_statistics(info)
+                    self.episode_results.append(result)
                     break
 
-                print("step:", current_t, " of ", self.env.steps)
-
-            # 场景结束时保留原有的回合最小 TTC 汇总。
-            self.generator.finalize_episode_stats()
-            self.update_running_statistics(info)
-            self.episode_results.append(self._build_episode_result(i, info, metric_offsets))
-            
-            if self.cfg.visualize:
-                scenario_movie_dir = os.path.join(str(self.cfg.movie_path), f"scenario_{i:03d}")
-                generate_video(name=f'scenario_{i:03d}', output_dir=scenario_movie_dir, delete_images=False)
+                print(
+                    "[难度控制] 场景 "
+                    f"{i} 难度={difficulty:.3f} 未命中 "
+                    f"{self.generator.target_difficulty:.3f}±"
+                    f"{self.generator.difficulty_tolerance:.3f}，从起点重放。"
+                )
+                self.generator.apply_scene_replay_feedback(difficulty)
+                self._rollback_attempt_metrics(metric_offsets)
             
             if self.cfg.verbose:
                 if self.cfg.behaviour_model.compute_metrics and self.env.behaviour_model is not None:
