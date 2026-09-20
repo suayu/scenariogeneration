@@ -1,6 +1,6 @@
-# LLMRiskWeaver：基于 LLM 与扩散模型的可控危险场景生成
+# RiskWeaver（险境织构）：基于 LLM 与扩散模型的可控危险场景生成
 
-**LLMRiskWeaver** 是本项目及完整方法的新名称；“Scenario Dreamer”仅用于指代所复用的上游闭环仿真器和对应原始基线，不再作为本方法名称。
+**RiskWeaver** 是本项目及完整方法的新名称；“Scenario Dreamer”仅用于指代所复用的上游闭环仿真器和对应原始基线，不再作为本方法名称。
 
 本分支在 Scenario Dreamer 闭环仿真器上集成了 LLM 高级攻击规划、Safe-Sim 多交通参与者联合扩散生成、静态障碍物调度和危险性评估，用于为指定自动驾驶策略生成可解释的挑战性测试场景。
 
@@ -350,7 +350,7 @@ Define environment variables to let the code know where things live:
 source $(pwd)/scripts/define_env_variables.sh
 ```
 
-### Conda Setup 
+### Conda Setup
 
 ```
 # create conda environment
@@ -364,12 +364,12 @@ wandb login
 
 ## Waymo Dataset Preparation <a name="waymo-dataset-preparation"></a>
 
-> **Quick Option:**  
+> **Quick Option:**
 > If you'd prefer to skip data extraction and preprocessing, you can directly download the prepared files.
 > Place the following tar files in your scratch directory and extract:
-> - `scenario_dreamer_ae_preprocess_waymo.tar` (preprocessed dataset for Scenario Dreamer autoencoder training on Waymo)  
+> - `scenario_dreamer_ae_preprocess_waymo.tar` (preprocessed dataset for Scenario Dreamer autoencoder training on Waymo)
 > - `scenario_dreamer_ctrl_sim_preprocess.tar.gz` (preprocessed dataset for CtRL-Sim training on Waymo)
-> [Download from Google Drive](https://drive.google.com/drive/folders/13DSHf2UhrvguD7i7iYL5SfSDhgLcW_ja?usp=sharing)  
+> [Download from Google Drive](https://drive.google.com/drive/folders/13DSHf2UhrvguD7i7iYL5SfSDhgLcW_ja?usp=sharing)
 
 <details> <summary><strong>Instructions</strong></summary>
 
@@ -402,12 +402,12 @@ bash scripts/preprocess_ctrl_sim_waymo_dataset.sh # preprocess data to facilitat
 
 ## NuPlan Dataset Preparation <a name="nuplan-dataset-preparation"></a>
 
-> **Quick Option:**  
+> **Quick Option:**
 > If you'd prefer to skip data extraction and preprocessing, you can directly download the prepared files:
 > Place the following files in your scratch directory and extract:
-> - `scenario_dreamer_nuplan.tar` (processed nuPlan data (required for computing metrics, but not required for training)) 
-> - `scenario_dreamer_ae_preprocess_nuplan.tar` (preprocessed dataset for Scenario Dreamer autoencoder training on nuplan)  
-> [Download from Google Drive](https://drive.google.com/drive/folders/13DSHf2UhrvguD7i7iYL5SfSDhgLcW_ja?usp=sharing)  
+> - `scenario_dreamer_nuplan.tar` (processed nuPlan data (required for computing metrics, but not required for training))
+> - `scenario_dreamer_ae_preprocess_nuplan.tar` (preprocessed dataset for Scenario Dreamer autoencoder training on nuplan)
+> [Download from Google Drive](https://drive.google.com/drive/folders/13DSHf2UhrvguD7i7iYL5SfSDhgLcW_ja?usp=sharing)
 
 <details> <summary><strong>Instructions</strong></summary>
 
@@ -415,17 +415,17 @@ We use the same extracted NuPlan data as [SLEDGE](https://github.com/autonomousv
 
 #### Step-by-Step Instructions
 
-1. **Install dependencies & download raw NuPlan data**  
-   Follow the guide in the [`installation.md`](https://github.com/RLuke22/sledge-scenario-dreamer/blob/main/docs/installation.md) file of our forked repo.  
+1. **Install dependencies & download raw NuPlan data**
+   Follow the guide in the [`installation.md`](https://github.com/RLuke22/sledge-scenario-dreamer/blob/main/docs/installation.md) file of our forked repo.
    This will walk you through:
    - Downloading the NuPlan dataset
    - Setting up the correct environment variables
    - Installing the `sledge-devkit`
 
-2. **Extract NuPlan data**  
+2. **Extract NuPlan data**
    Use the instructions under [“1. Feature Caching”](https://github.com/RLuke22/sledge-scenario-dreamer/blob/main/docs/autoencoder.md#1-feature-caching) in the `autoencoder.md` to preprocess the NuPlan data.
 
-3. **Extract train/val/test splits and preprocess data for training**  
+3. **Extract train/val/test splits and preprocess data for training**
    Run the following to extract train/val/test splits and create the preprocessed data for training.
    ```
    bash scripts/extract_nuplan_data.sh # create train/val/test splits and create eval set for computing metrics
@@ -436,7 +436,7 @@ We use the same extracted NuPlan data as [SLEDGE](https://github.com/autonomousv
 
 ## Pre-Trained Checkpoints <a name="pretrained-checkpoints"></a>
 
-Pre-trained checkpoints can be downloaded from [Google Drive](https://drive.google.com/drive/folders/1G9jUA_wgF2Vo40I5HckO1yxUjA_0kUEJ?usp=sharing). Place the `checkpoints` directory into your scratch (`$SCRATCH_ROOT`) directory. 
+Pre-trained checkpoints can be downloaded from [Google Drive](https://drive.google.com/drive/folders/1G9jUA_wgF2Vo40I5HckO1yxUjA_0kUEJ?usp=sharing). Place the `checkpoints` directory into your scratch (`$SCRATCH_ROOT`) directory.
 
 To download all checkpoints into your scratch directory, run:
 ```bash
@@ -577,7 +577,7 @@ python train.py \
 
 - Ensure your ldm run name is different to your autoencoder run name. By default, `ldm.train.run_name` is set to `scenario_dreamer_ldm_base_[waymo|nuplan]`.
 
-</details> 
+</details>
 
 <details> <summary><strong>Scenario Dreamer Large</strong></summary>
 
@@ -598,7 +598,7 @@ python train.py \
 
 </details>
 
-</details>  
+</details>
 
 <details> <summary><strong>3. What to Expect</strong></summary>
 
@@ -635,7 +635,7 @@ By default `ctrl_sim.train.run_name` is set to `ctrl_sim_waymo`.
 <details> <summary><strong>3. What to Expect</strong></summary>
 
 - By default, trains for 1M steps. However, we used 500k-step checkpoint in paper due to resource limitations.
-- Trains on 4 GPUs (≈ 100 h with 4 A100 GPUs to 1M steps). 
+- Trains on 4 GPUs (≈ 100 h with 4 A100 GPUs to 1M steps).
 - Training metrics and visualizations are logged to Weights & Biases (W&B).
 - After each epoch, a single checkpoint (overwritten to `last.ckpt`) is saved to `$SCRATCH_ROOT/checkpoints/[your_ctrl_sim_run_name]`. The 15 checkpoints
 with lowest val loss are additionally saved to `$SCRATCH_ROOT/checkpoints/[your_ctrl_sim_run_name]`.
@@ -703,13 +703,13 @@ To additionally cache the samples to disk for metrics computation, set `ldm.eval
 
 <details> <summary><strong>3. What to Expect</strong></summary>
 
-- 100 samples will be generated on 1 GPU with a default batch size of 32. 
+- 100 samples will be generated on 1 GPU with a default batch size of 32.
 - The samples will be visualized to `$PROJECT_ROOT/viz_gen_samples_[your_ldm_run_name]`.
 - If you toggle `ldm.eval.cache_samples=True`, samples will be cached to `$SCRATCH_ROOT/checkpoints/[your_ldm_run_name]/initial_scene_samples`.
 
 </details>
 
-</details> 
+</details>
 
 <details> <summary><strong>Lane-conditioned Object Generation</strong></summary>
 
@@ -742,7 +742,7 @@ This will load lane latents from the validation set for conditioning. You can ad
 
 <details> <summary><strong>3. What to Expect</strong></summary>
 
-- 100 lane-conditioned samples will be generated on 1 GPU with a default batch size of 32. 
+- 100 lane-conditioned samples will be generated on 1 GPU with a default batch size of 32.
 - The lane-conditioned samples will be visualized to `$PROJECT_ROOT/viz_gen_samples_[your_ldm_run_name]`.
 
 </details>
@@ -755,7 +755,7 @@ This will load lane latents from the validation set for conditioning. You can ad
 
 - Verify that you have a trained autoencoder and ldm.
 - Verify that you have generated and cached a set of scenarios by following the steps in [Initial Scene Generation](#initial-scene-generation). By default,
-the scenarios are saved to `/path/to/ldm/checkpoint/initial_scene_samples`. 
+the scenarios are saved to `/path/to/ldm/checkpoint/initial_scene_samples`.
 
 </details>
 
@@ -781,14 +781,14 @@ This script will load each of the initial scenes, randomly sample a valid route 
 
 <details> <summary><strong>3. What to Expect</strong></summary>
 
-- 100 inpainted samples will be generated on 1 GPU with a default batch size of 32. 
+- 100 inpainted samples will be generated on 1 GPU with a default batch size of 32.
 - The inpainted samples will be visualized to `$PROJECT_ROOT/viz_gen_samples_[your_ldm_run_name]`.
 
 </details>
 
 </details>
 
-### 📊 Compute Evaluation Metrics 
+### 📊 Compute Evaluation Metrics
 
 <details> <summary><strong>1. Prerequisites</strong></summary>
 
@@ -867,7 +867,7 @@ By setting `ldm.eval.visualize=True`, the script will visualize the partially ge
 
 <details> <summary><strong>3. What to Expect</strong></summary>
 
-- 10 simulation environments will be generated on 1 GPU with a default batch size of 32. 
+- 10 simulation environments will be generated on 1 GPU with a default batch size of 32.
 - The partial and complete simulation environments will be visualized to `$SCRATCH_ROOT/checkpoints/[your_ldm_run_name]/viz_sim_envs_[waymo|nuplan]`.
 - The complete simulation environments are written to disk at `$SCRATCH_ROOT/checkpoints/[your_ldm_run_name]/complete_sim_envs`.
 
@@ -889,7 +889,7 @@ By setting `ldm.eval.visualize=True`, the script will visualize the partially ge
       postprocess_sim_envs.run_name=[your_ldm_run_name] \
       postprocess_sim_envs.route_length=200
     ```
-  - **Option B (Use pre-generated)**: By default, we provide a small set of 75 postprocessed Waymo simulation environments, each with a 200 m route length in [`metadata/simulation_environment_datasets/scenario_dreamer_waymo_200m`](metadata/simulation_environment_datasets/scenario_dreamer_waymo_200m). 
+  - **Option B (Use pre-generated)**: By default, we provide a small set of 75 postprocessed Waymo simulation environments, each with a 200 m route length in [`metadata/simulation_environment_datasets/scenario_dreamer_waymo_200m`](metadata/simulation_environment_datasets/scenario_dreamer_waymo_200m).
 
 - **Trained CtRL-Sim Model**: You need a trained CtRL-Sim behaviour model checkpoint. You can either:
   - Train your own by following the instructions in [CtRL-Sim Training](#ctrlsim-training).
@@ -918,7 +918,7 @@ By default, we simulate vehicles, pedestrians, and cyclists. To simulate only ve
 <details> <summary><strong>3. What to Expect</strong></summary>
 
 - The simulator will run through all simulation environments in the specified dataset path.
-- By default, each simulation runs at 10 Hz for 400 steps (configurable via `sim.steps`), which is tailored to 200 m route lengths. 
+- By default, each simulation runs at 10 Hz for 400 steps (configurable via `sim.steps`), which is tailored to 200 m route lengths.
 - The IDM policy is used by default to control the ego vehicle, while other agents are controlled by the CtRL-Sim behaviour model.
 - If visualization is enabled, videos will be saved to the specified `sim.movie_path` directory.
 - If verbose mode is enabled, metrics (collision rate, off-route rate, completion rate, and progress) will be printed after each simulation.
@@ -930,7 +930,7 @@ By default, we simulate vehicles, pedestrians, and cyclists. To simulate only ve
 
 <details> <summary><strong>Introduction</strong></summary>
 
-This repository supports evaluating RL agents trained in (adapted) GPUDrive on both Waymo and Scenario Dreamer environments. We forked the GPUDrive repository and adapted it so that the RL agents are trained on the Scenario Dreamer scene representation. This allows the RL agents to be evaluated in Scenario Dreamer environments. 
+This repository supports evaluating RL agents trained in (adapted) GPUDrive on both Waymo and Scenario Dreamer environments. We forked the GPUDrive repository and adapted it so that the RL agents are trained on the Scenario Dreamer scene representation. This allows the RL agents to be evaluated in Scenario Dreamer environments.
 
 We provide the following:
 - The fork of GPUDrive that is adapted for Scenario Dreamer compatibility. We fork the latest commit of GPUDrive as of Jan 9, 2026 (commit [aa48a43](https://github.com/Emerge-Lab/gpudrive/tree/aa48a431ed127a37610cc2176db30ec73d0c55df)) and make the necessary changes to train Scenario Dreamer-compatible RL agents.
@@ -975,11 +975,11 @@ We evaluate the provided checkpoint across the same evaluation configurations as
 
 ### Generating the GPUDrive Training JSON Files
 
-> **Quick Option:**  
+> **Quick Option:**
 > If you'd prefer to skip generation of the gpudrive training dataset, you can directly download the 10k prepared json files:
 > Place the following files in your scratch directory and extract:
-> - `gpudrive_training_set_jsons.tar` (10k gpudrive training scenarios in Scenario Dreamer-compatible format) 
-> [Download from Google Drive](https://drive.google.com/drive/folders/13DSHf2UhrvguD7i7iYL5SfSDhgLcW_ja?usp=sharing)  
+> - `gpudrive_training_set_jsons.tar` (10k gpudrive training scenarios in Scenario Dreamer-compatible format)
+> [Download from Google Drive](https://drive.google.com/drive/folders/13DSHf2UhrvguD7i7iYL5SfSDhgLcW_ja?usp=sharing)
 
 <details> <summary><strong>Instructions</strong></summary>
 
@@ -988,7 +988,7 @@ To generate the Scenario Dreamer-compatible gpudrive training set jsons (size 10
 # generate pickle files (compatible with Scenario Dreamer simulator)
 python data_processing/waymo/create_gpudrive_pickles.py \
   dataset_name=waymo \
-  preprocess_waymo.mode=val 
+  preprocess_waymo.mode=val
 # generate json files from pickle files (compatible with adapted GPUDrive simulator)
 python data_processing/waymo/convert_pickles_to_jsons.py \
   dataset_name=waymo \
@@ -996,15 +996,15 @@ python data_processing/waymo/convert_pickles_to_jsons.py \
   convert_pickles_to_jsons.dataset_size=10000
 ```
 
-</details> 
+</details>
 
 ### Generating the Evaluation Datasets
 
-> **Quick Option:**  
+> **Quick Option:**
 > If you'd prefer to skip generation of the evaluation datasets, you can directly download the prepared files:
 > Place the following files in your **metadata** directory and extract:
-> - `simulation_environment_datasets.tar` (250 pickles/jsons for: waymo test, scenario dreamer 55m routes, scenario dreamer 100m routes) 
-> [Download from Google Drive](https://drive.google.com/drive/folders/13DSHf2UhrvguD7i7iYL5SfSDhgLcW_ja?usp=sharing) 
+> - `simulation_environment_datasets.tar` (250 pickles/jsons for: waymo test, scenario dreamer 55m routes, scenario dreamer 100m routes)
+> [Download from Google Drive](https://drive.google.com/drive/folders/13DSHf2UhrvguD7i7iYL5SfSDhgLcW_ja?usp=sharing)
 
 <details> <summary><strong>Instructions</strong></summary>
 
@@ -1090,7 +1090,7 @@ Ensure that you have generated or downloaded the Scenario Dreamer-compatible gpu
 
 <details> <summary><strong>2. Training an RL Policy</strong></summary>
 
-The custom configurations we used can be found at `gpudrive/baselines/ppo/config/ppo_base_puffer.yaml`. 
+The custom configurations we used can be found at `gpudrive/baselines/ppo/config/ppo_base_puffer.yaml`.
 
 To train an RL policy, run:
 ```bash
@@ -1113,7 +1113,7 @@ We manually terminated the run after 500 epochs (~250M steps), but it will train
 
 ![GPUDrive Training Performance Trend](metadata/gpudrive_trend.png)
 
-</details> 
+</details>
 
 </details>
 
@@ -1162,7 +1162,7 @@ You can visualize the simulations by setting `sim.visualize=True`.
 
 <details> <summary><strong>3. What to Expect</strong></summary>
 
-- The RL policy will be evaluated on 250 simulation environments on 1 GPU. 
+- The RL policy will be evaluated on 250 simulation environments on 1 GPU.
 - The planner metrics (collision rate, offroad rate, goal success rate, progress) will be aggregated and reported after each simulation.
 - If you set `sim.visualize=True`, simulations will be visualized as mp4s to the `movies` directory.
 

@@ -134,37 +134,43 @@ class DiffusionTraj(Module):
 
         # --- 3. 配置部分扩散（若有）---
         partial_diffusion_cfg = self._setup_partial_diffusion(guide_config, adv_proposals_dict, num_samples)
-        
+
         # Main diffusion loop
         a_t = a_T
         stride = sample_step
+        if not isinstance(stride, int) or stride <= 0:
+            raise ValueError("sample_step must be a positive integer")
         denoised_traj_list = [] # 用于存储中间去噪结果
 
         # --- 4. 主去噪循环 ---
         for t in range(self.var_sched.num_steps, 0, -stride):
-            z = torch.randn_like(a_T) if t > 1 else torch.zeros_like(a_T)
+            # 跳步采样使用 t 到 next_t 的有效方差，末步必须到达干净的第 0 步。
+            next_t = max(t - stride, 0)
+            z = torch.randn_like(a_T) if next_t > 0 else torch.zeros_like(a_T)
             # 获取当前时间步的调度参数
-            alpha = self.var_sched.alphas[t]
             alpha_bar = self.var_sched.alpha_bars[t]
-            alpha_bar_next = self.var_sched.alpha_bars[t - stride]
+            alpha_bar_next = self.var_sched.alpha_bars[next_t]
             beta_val = self.var_sched.betas[t]
-            sigma = self.var_sched.get_sigmas(t, flexibility)
+            alpha = alpha_bar / alpha_bar_next
+            step_beta = 1 - alpha
+            posterior_variance = step_beta * (1 - alpha_bar_next) / (1 - alpha_bar)
+            sigma = step_beta.sqrt() * flexibility + posterior_variance.clamp_min(0).sqrt() * (1 - flexibility)
 
             # ---- 部分扩散替换 ----
             # replace the adv a_t if passes the diffusion steps
             if partial_diffusion_cfg["enabled"] and t == partial_diffusion_cfg["partial_step"]:
                 a_t = self._replace_with_partial_diffusion(
-                    a_t, 
-                    batch_size, 
-                    num_samples, 
-                    num_points, 
+                    a_t,
+                    batch_size,
+                    num_samples,
+                    num_points,
                     point_dim,
                     partial_diffusion_cfg["adv_proposals"],
                     partial_diffusion_cfg["adv_idx"]
                 )
 
             # ---- 计算系数 c0, c1 （用于 DDPM 更新） ----
-            c0 = torch.sqrt(alpha_bar_next) * beta_val / (1 - alpha_bar)
+            c0 = torch.sqrt(alpha_bar_next) * step_beta / (1 - alpha_bar)
             c1 = torch.sqrt(alpha) * (1 - alpha_bar_next) / (1 - alpha_bar)
 
             # ---- 带梯度的引导（若启用） ----
@@ -213,7 +219,7 @@ class DiffusionTraj(Module):
                             multiple_guidance_strategy = guide_config.params.multiple_guidance_strategy,
                             grad_wrt = guide_config.params.grad_wrt,
                         ) # 执行多步引导修正：通过计算引导损失关于 action 的梯度，沿梯度方向更新 action
-                       
+
                     # ---- 根据采样模式计算 a_next ----
                     if sampling_mode == "ddpm":
                         a_next = c0 * a0_predict + c1 * a_t + sigma * z
@@ -301,6 +307,8 @@ class DiffusionTraj(Module):
             修正后的 action。
         """
         for i in range(n_guide_steps):
+            # 每次以当前动作为叶节点，保留动力学梯度但不穿过已完成的去噪网络。
+            action = action.detach().requires_grad_(True)
             action_original = action.clone()  # Keep a copy of original action
 
             # 若存在动力学，将 action 映射为轨迹
@@ -323,7 +331,7 @@ class DiffusionTraj(Module):
 
         return action
 
-   
+
     def apply_conditioning(x, conditions, action_dim):
         for t, val in conditions.items():
             x[:, t, action_dim:] = val.clone()
@@ -364,7 +372,7 @@ class DiffusionTraj(Module):
         a_pert = c0 * a_0 + c1 * e_rand
 
         return a_pert  # (num_adv, sample, T, 2)
-    
+
     def handle_partial_diffusion(
         a_t: torch.Tensor,
         batch_size: int,
@@ -402,7 +410,7 @@ class DiffusionTraj(Module):
             a_t[partial_cfg["adv_idx"]] = partial_cfg["adv_proposals"]
             a_t = a_t.view(batch_size * sample, num_points, point_dim)
         return a_t
-    
+
     @staticmethod
     def apply_fixed_actions(action, fixed_actions, indices):
         action[:, indices] = fixed_actions[:, indices]
@@ -415,8 +423,8 @@ class DiffusionTraj(Module):
                 "enabled": True,
                 "partial_step": guide_config.params.partial_t,
                 "adv_proposals": self.add_diffusion_noise(
-                    adv_proposals_dict["adv_proposals"], 
-                    t=guide_config.params.partial_t, 
+                    adv_proposals_dict["adv_proposals"],
+                    t=guide_config.params.partial_t,
                     sample_size=sample
                 ),
                 "adv_idx": adv_proposals_dict["adv_idx"],

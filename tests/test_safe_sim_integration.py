@@ -16,6 +16,7 @@ from policies.obstacles import ObstacleCatalog, StaticObstacle
 from policies.safe_sim_adapter import SafeSimBatchAdapter
 from policies.traffic_types import JointTrajectory, ScenarioFrame
 from scenario_generator import AdversarialScenarioGenerator
+from policies.difficulty_control import DifficultyController
 from simulator import Simulator
 from utils.llm_scene_viz import render_llm_scene_png
 
@@ -319,11 +320,15 @@ def test_scene_replay_feedback_moves_initial_stage_toward_target():
     generator.difficulty_mode = "target"
     generator.target_difficulty = 0.75
     generator.difficulty_tolerance = 0.10
-    generator._scene_replay_stage = 1
+    generator.difficulty_controller = DifficultyController()
+    generator._scene_replay_stage = 0.5
 
-    assert generator.apply_scene_replay_feedback(0.40) == 2
-    assert generator.apply_scene_replay_feedback(0.95) == 1
-    assert generator.apply_scene_replay_feedback(0.78) == 1
+    raised = generator.apply_scene_replay_feedback(0.40)
+    assert raised > 0.5
+    lowered = generator.apply_scene_replay_feedback(0.95)
+    assert lowered < raised
+    assert generator.apply_scene_replay_feedback(0.78) == lowered
+    assert generator.apply_scene_replay_feedback(0.40, collision=True) < lowered
 
 
 def test_wrapper_selects_one_shared_sample_from_joint_guidance_loss():
@@ -336,7 +341,8 @@ def test_wrapper_selects_one_shared_sample_from_joint_guidance_loss():
 
         @staticmethod
         def _prepare_guidance_data(model_batch):
-            return {"batch_size": 2}
+            return {"batch_size": 2, "world_from_agent": torch.eye(3).repeat(6,1,1),
+                    "ego_extents": torch.tensor([[4.,2.],[4.,2.]])}
 
     wrapper = DiffusionModelWrapper.__new__(DiffusionModelWrapper)
     wrapper.guidance_enabled = True
@@ -344,6 +350,7 @@ def test_wrapper_selects_one_shared_sample_from_joint_guidance_loss():
     positions[:, 0, 0, 0] = torch.tensor([0.0, 10.0])
     positions[:, 1, 0, 0] = torch.tensor([2.0, 2.0])
     positions[:, 2, 0, 0] = torch.tensor([5.0, 5.0])
+    positions[1, :, 0, 1] = 20.0
     yaws = torch.zeros((2, 3, 1, 1))
     action = SimpleNamespace(
         positions=torch.zeros((2, 1, 2)),
@@ -863,7 +870,7 @@ def test_llm_scene_filter_does_not_mutate_simulator_active_mask():
     assert sim.viz_state["agent_active"].tolist() == [True, True]
 
 
-def test_obstacle_catalog_materializes_six_abstract_templates():
+def test_obstacle_catalog_materializes_seven_abstract_templates():
     catalog = ObstacleCatalog()
     expected_types = {
         "transverse_barrier",
@@ -872,6 +879,7 @@ def test_obstacle_catalog_materializes_six_abstract_templates():
         "disabled_vehicle",
         "debris_cluster",
         "construction_block",
+        "construction_zone",
     }
 
     assert expected_types == set(catalog.type_names)
@@ -891,6 +899,16 @@ def test_obstacle_catalog_materializes_six_abstract_templates():
             assert {item.primitive_type for item in obstacles} == {"transverse_barrier", "cone_line"}
         else:
             assert all(item.primitive_type == primitive_type for item in obstacles)
+
+
+def test_construction_zone_is_rectangular_water_barrier_perimeter():
+    obstacles = ObstacleCatalog().materialize({
+        'type':'construction_zone','center':[0.,20.],'yaw':0.,'count':2,'spacing':4.
+    }, lambda name:f'{name}-{len(name)}')
+    assert len(obstacles) >= 2 * 12 + 2 * 6
+    assert all(item.object_kind == 'barrier' and item.width < item.length for item in obstacles)
+    centers=np.asarray([item.center_global for item in obstacles])
+    assert np.ptp(centers[:,0]) >= 16 and np.ptp(centers[:,1]) >= 7
 
 
 def test_scenario_dreamer_obstacle_wrapper_supports_crud_and_collision():

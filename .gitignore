@@ -51,3 +51,8 @@ run.sh
 /tests/run_full_adversarial_evaluation.py
 .env
 .env.*
+# RiskWeaver generated experiments and local scratch data
+/experiments/
+/logs/
+/nl_guidance_eval/
+/work/

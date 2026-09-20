@@ -4,6 +4,7 @@ from typing import Any, Dict
 
 import torch
 import torch.nn.functional as F
+from policies.guidance_state import guidance_local_yaw
 
 
 def resolve_attack_contact_schedule(
@@ -61,8 +62,8 @@ def register_scenario_guidance():
         "scenario_collision": {
             "safety_margin": 0.5,
             "temperature": 0.5,
-            "loss_timesteps": 20,
-            "filter_timesteps": 20,
+            "loss_timesteps": 32,
+            "filter_timesteps": 32,
             "loss_scale": 1.0,
             "attack_protection_frames": 2,
             "attack_relaxation_frames": 6,
@@ -72,11 +73,11 @@ def register_scenario_guidance():
             "contact_loss_scale": 1.0,
             "penetration_loss_scale": 5.0,
             "safety_penetration_loss_scale": 100.0,
-            "background_pair_penetration_loss_scale": 1000.0,
-            "background_pair_safety_loss_scale": 5.0,
+            "background_pair_penetration_loss_scale": 2000.0,
+            "background_pair_safety_loss_scale": 50.0,
             "max_speed": 20.0,
             "max_acceleration": 6.0,
-            "max_jerk": 12.0,
+            "max_jerk": 20.0,
             "max_step_distance": 2.0,
             "kinematics_loss_scale": 1.0,
         },
@@ -166,8 +167,8 @@ def register_scenario_guidance():
                 self,
                 safety_margin=0.5,
                 temperature=0.5,
-                loss_timesteps=20,
-                filter_timesteps=20,
+                loss_timesteps=32,
+                filter_timesteps=32,
                 loss_scale=1.0,
                 attack_protection_frames=2,
                 attack_relaxation_frames=6,
@@ -177,11 +178,11 @@ def register_scenario_guidance():
                 contact_loss_scale=1.0,
                 penetration_loss_scale=5.0,
                 safety_penetration_loss_scale=100.0,
-                background_pair_penetration_loss_scale=1000.0,
-                background_pair_safety_loss_scale=5.0,
+                background_pair_penetration_loss_scale=2000.0,
+                background_pair_safety_loss_scale=50.0,
                 max_speed=20.0,
                 max_acceleration=6.0,
-                max_jerk=12.0,
+                max_jerk=20.0,
                 max_step_distance=2.0,
                 kinematics_loss_scale=1.0,
             ):
@@ -315,7 +316,7 @@ def register_scenario_guidance():
                         batch_size, 1
                     )
                 extents = configured_extents.to(world).clamp_min(0.1)
-                local_yaw = state[..., 2].reshape(
+                local_yaw = guidance_local_yaw(state).reshape(
                     batch_size, num_samples, horizon
                 )
                 configured_yaw = params.get("yaw")
@@ -549,6 +550,11 @@ def register_scenario_guidance():
                 closest_distance = torch.linalg.norm(closest_vector, dim=-1)
                 valid = (ttc > 0.0) & (ttc <= self.max_ttc)
                 risk = torch.exp(-ttc.clamp_min(0.0) / self.time_bandwidth)
+                if params.get('profile_ttc_band') is not None:
+                    lower,upper = params['profile_ttc_band'][0].to(ttc)
+                    # 区间内平台收益；低于下界会降低收益，不能以 TTC 越小越好。
+                    deviation = F.relu(lower-ttc)+F.relu(ttc-upper)
+                    risk = torch.exp(-deviation/self.time_bandwidth)
                 risk = risk * torch.exp(-closest_distance / self.distance_bandwidth) * valid
 
                 # 仅允许当前占用边界已进入近场的车辆接受趋近梯度；远车严格为零。

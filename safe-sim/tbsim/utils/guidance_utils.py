@@ -44,18 +44,18 @@ def initialize_loss_calculator(guide_config=None):
     if isinstance(guide_config, Dict):
         # Convert old-style config to new GuidanceConfig
         guidance_config = GuidanceConfig()
-        
+
         # Set guidance functions
         guidance_config.set_guidance_fn(guide_config.guidance_fn)
-        
+
         # Update optimization parameters
         if hasattr(guide_config, "params"):
             guidance_config.update_params(guide_config.params)
-            
+
         # Update combined loss configuration
         if hasattr(guide_config, "combineloss_config"):
             guidance_config.update_combine_loss(guide_config.combineloss_config)
-            
+
         # Update individual guidance configurations
         if hasattr(guide_config, "guidance_configs"):
             for name in guide_config.guidance_fn:
@@ -78,7 +78,7 @@ def initialize_loss_calculator(guide_config=None):
         )
     else:
         return calculators[0]
-    
+
 class Guidance(ABC):
     def __init__(self, loss_timesteps=None, filter_timesteps=None, loss_scale=1.0) -> None:
         """loss_timesteps: the horizon that we calculate the loss
@@ -94,7 +94,7 @@ class Guidance(ABC):
     @abstractmethod
     def calculate_loss(self, action, state, data_batch_for_guidance):
         """Calculate loss with guidance data
-        
+
         Args:
             action: Action trajectories
             state: State trajectories
@@ -118,9 +118,8 @@ class Guidance(ABC):
         """
         # 请注意，我们应通过奖励引导它而非损失
         loss = self.calculate_loss(action, state, data_batch_for_guidance) # 计算route、collision、ttc、causecollision
-        if grad_wrt == "clean_guide":
-            grad = torch.autograd.grad(-loss.sum(), a_t, retain_graph=True)[0]
-        elif grad_wrt == "noisy_guide":
+        if grad_wrt in ("clean_guide", "noisy_guide"):
+            # 内环直接更新 action；必须对同一变量求导，不能混入去噪网络对 a_t 的雅可比。
             grad = torch.autograd.grad(-loss.sum(), action, retain_graph=True)[0]
         else:
             raise NotImplementedError(f"Unknown grad_wrt: {grad_wrt}")
@@ -151,20 +150,20 @@ class CombinedLossCalculator(Guidance):
         super().__init__()
         assert len(weights) == len(loss_calculators),"Number of weights does not match number of loss calculators"
         self.loss_calculator_dict = {calc.name: calc for calc in loss_calculators}
-        
+
         self.weights = torch.tensor(weights if weights is not None else [1.0] * len(loss_calculators))
         self.ctrl_weights = torch.tensor(ctrl_weights if ctrl_weights is not None else self.weights.clone())
-        
-        
+
+
         # Filter setup
         assert args["filter_criterion"] in ["combined", "individual", "weight_combined", "heirachical"]
         self.filter_criterion = args["filter_criterion"]
         self.filter_target = args["filter_target"]
-        
+
         # Control target setup
         self.ctrl_filter_target = args["ctrl_filter_target"] if "ctrl_filter_target" in args else None
         self.ctrl_filter_criterion = args.get("ctrl_filter_criterion")
-        
+
         if self.filter_criterion == "weight_combined":
             self.filter_weights = {type(calc).__name__: w for calc, w in zip(loss_calculators, args.filter_weights)}
         self.batch_weights = None
@@ -183,7 +182,7 @@ class CombinedLossCalculator(Guidance):
         """
         # 初始化总损失
         total_loss = torch.zeros(action.shape[:2]).to(action.device)
-        
+
         # 遍历所有类型的损失计算器
         for idx, (loss_name, calculator) in enumerate(self.loss_calculator_dict.items()):
             # 计算单项损失
@@ -200,7 +199,7 @@ class CombinedLossCalculator(Guidance):
 
             # 加权累计损失
             total_loss = total_loss + w * loss_term
-            
+
         return total_loss
 
     def filter(self, action, state, data_batch_for_guidance):
@@ -213,7 +212,7 @@ class CombinedLossCalculator(Guidance):
             filtered_a_trajs = self.loss_calculator_dict[self.filter_target].filter(
                 action, state, data_batch_for_guidance
             )
-            
+
             if hasattr(self, "control_mask") and self.ctrl_filter_target is not None:
                 control_mask = self.control_mask
                 if self.ctrl_filter_criterion == "individual":
@@ -221,7 +220,7 @@ class CombinedLossCalculator(Guidance):
                         action, state, data_batch_for_guidance
                     )
                     filtered_a_trajs[control_mask] = filtered_all_ctrl[control_mask]
-                    
+
             return filtered_a_trajs
 
     def _filter_combined(self, action, state, data_batch_for_guidance):
@@ -335,11 +334,11 @@ class ConstantSpeedLossCalculator(Guidance):
 @register_guidance("route")
 class RouteLossCalculator(Guidance):
     def __init__(
-        self, 
-        lane_margin=1.0, 
-        nonlinear_factor=5.0, 
-        loss_timesteps=None, 
-        filter_timesteps=None, 
+        self,
+        lane_margin=1.0,
+        nonlinear_factor=5.0,
+        loss_timesteps=None,
+        filter_timesteps=None,
         loss_scale=1.0,
         max_penalty_value=100.0,  # Added parameter
         tangential_reward_scale=0.0,  # Added parameter
@@ -351,7 +350,7 @@ class RouteLossCalculator(Guidance):
         self.non_linear_margin = lane_margin + 0.5
         self.nonlinear_factor = nonlinear_factor
         self.loss_scale = loss_scale
-        
+
         # Move magic numbers to attributes
         self.max_penalty_value = max_penalty_value
         self.tangential_reward_scale = tangential_reward_scale
@@ -359,15 +358,15 @@ class RouteLossCalculator(Guidance):
 
     def update_config(self, config: Dict[str, Any]):
         pass
-        
+
     def update_params(self, params: Dict[str, torch.Tensor]) -> None:
         pass
-        
+
     def calculate_loss(self, action, state, params):
         # Extract parameters from params dictionary
         lane = params.get("centerline")  # Assumed to be already correctly shaped
         lane_avail = params.get("lane_avail")
-        
+
         # Calculate the loss based on the trajectories (x, y, yaw)
         ego_trajectories = torch.cat([state[..., :2], state[..., 3:4]], dim=-1)
         Ne, T = ego_trajectories.shape[:2]
@@ -383,8 +382,8 @@ class RouteLossCalculator(Guidance):
 
         # Apply nonlinear penalty
         nonlinear_penalty = torch.where(
-            margin_to_lane >= self.non_linear_margin, 
-            self.nonlinear_factor * (margin_to_lane - self.non_linear_margin), 
+            margin_to_lane >= self.non_linear_margin,
+            self.nonlinear_factor * (margin_to_lane - self.non_linear_margin),
             margin_to_lane
         )
 
@@ -434,7 +433,7 @@ class CollisionLossCalculator(Guidance):
         loss_timesteps=None,
         filter_timesteps=None,
         adv_mode=False,
-        loss_scale=1.0, 
+        loss_scale=1.0,
         **kwargs #not using this but dummy for inheritance
     ):
         super().__init__(loss_timesteps, filter_timesteps, loss_scale)
@@ -503,7 +502,7 @@ class CollisionLossCalculator(Guidance):
         pass
     def calculate_loss(self, action, state, data_batch_for_guidance):
         """Calculate collision loss based on the provided parameters and mode.
-        
+
         Args:
             action: Action trajectories
             state: State trajectories
@@ -527,12 +526,12 @@ class CollisionLossCalculator(Guidance):
         # Create scene mask
         scene_ids = data_batch_for_guidance["scene_ids"]
         scene_mask = create_scene_mask(scene_ids).to(agent_yaw.device)
-        
+
         # Get agent position from world transform
         agent_pos = None #not using for now
 
         # Transform state to world coordinates
-        world_xy_fut = transform_points_tensor(state[..., :2], world_from_agent)        
+        world_xy_fut = transform_points_tensor(state[..., :2], world_from_agent)
         # Reshape to samples B,N
         action = action.reshape((batch_size, -1, *action.shape[1:]))
         world_xy_fut = world_xy_fut.reshape((batch_size, -1, *world_xy_fut.shape[1:]))
@@ -544,14 +543,14 @@ class CollisionLossCalculator(Guidance):
             T = world_xy_fut.shape[2]
             speed = agent_speed.unsqueeze(1).unsqueeze(2).unsqueeze(3).expand(-1, -1, T, -1)
             yaw = agent_yaw.unsqueeze(1).unsqueeze(2).unsqueeze(3).expand(-1, -1, T, -1)
-            
+
             dt = data_batch_for_guidance["dt"]
             time_steps = torch.arange(1, T + 1).float().to(agent_speed.device) * dt
-            
+
             delta_pos = speed * time_steps.unsqueeze(0).unsqueeze(-1) * torch.cat(
                 (torch.cos(yaw), torch.sin(yaw)), dim=-1
             )
-            
+
             predicted_pos = agent_pos.unsqueeze(1).unsqueeze(2) + torch.cumsum(delta_pos, dim=-2)
             distances, dist_vec = pairwise_distances(world_xy_fut, predicted_pos)
         else:  # multi_agent mode
@@ -561,15 +560,15 @@ class CollisionLossCalculator(Guidance):
             cos_vec = torch.cos(world_yaw)
             sin_vec = torch.sin(world_yaw)
             long_vec = torch.cat([cos_vec, sin_vec], dim=-1)
-            
+
             heading_dist_vec, non_heading_dist_vec = self.batch_vector_projection(dist_vec, long_vec)
             heading_distances = torch.linalg.norm(heading_dist_vec, dim=-1) - extents[:, None, None, 0:1] / 2
             non_heading_distances = torch.linalg.norm(non_heading_dist_vec, dim=-1) - extents[:, None, None, 1:2] / 2
-            
+
             heading_distances_normalized = heading_distances / (self.sigma * self.heading_weight)
             non_heading_distances_normalized = non_heading_distances / self.sigma
             buff_dist_term = self.buff_dist**2 if self.buff_dist < 0 else -self.buff_dist**2
-            
+
             collision_loss = torch.exp(
                 -0.5 * (heading_distances_normalized**2 + non_heading_distances_normalized**2 + buff_dist_term)
             ) #B,B,N,T
@@ -583,7 +582,7 @@ class CollisionLossCalculator(Guidance):
         identity_mask = torch.eye(collision_loss.shape[0]).unsqueeze(2).unsqueeze(-1).to(collision_loss.device)
         collision_loss = collision_loss * (1 - identity_mask)
         collision_loss = collision_loss.masked_fill(~scene_mask[:, :, None, None], 0.0)
-        
+
         if self.adv_mode:
             #Set ego-adv car pair to zero to encrouange colllisions
             assert (self.ego_mask is not None and self.ctrl_mask is not None), "Ego and ctrl masks are not provided"
@@ -593,17 +592,17 @@ class CollisionLossCalculator(Guidance):
 
         if self.loss_timesteps is not None:
             collision_loss[:, self.loss_timesteps:] = 0.0
-            
+
         return collision_loss * self.loss_scale
-  
+
     @staticmethod
     def batch_vector_projection(vec, onto_vec):
         """Computes the vector projection and orthogonal component in batch form.
-        
+
         Args:
             vec (torch.Tensor): Input vectors of shape (B,B,N,T,2)
             onto_vec (torch.Tensor): Projection vectors of shape (B,N,1,T,2)
-        
+
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: (projection, orthogonal_comp) both of shape (B,B,N,T,2)
         """
@@ -706,7 +705,7 @@ class CollisionLossCalculator(Guidance):
         collision_loss = cur_penalties
 
         return collision_loss
-    
+
 
 @register_guidance("ttc")
 class TimeToCollisionLossCalculator(Guidance):
@@ -730,7 +729,7 @@ class TimeToCollisionLossCalculator(Guidance):
         self._d_bw = distance_bandwidth
         self._t_bw = time_bandwidth
         self._min_v = min_velocity_diff
-        
+
         # Only keep masks as attributes since they're configuration-dependent
         self.ctrl_indices = None
         self.ego_indices = None
@@ -759,7 +758,7 @@ class TimeToCollisionLossCalculator(Guidance):
         # Transform coordinates
         world_xy_fut = transform_points_tensor(state[..., :2], world_from_agent)
         world_yaw = state[..., -1] + agent_yaw.unsqueeze(-1)
-        
+
         # Calculate velocities
         vx = state[..., -2] * torch.cos(world_yaw)
         vy = state[..., -2] * torch.sin(world_yaw)
@@ -769,14 +768,14 @@ class TimeToCollisionLossCalculator(Guidance):
         B_N,T,_ = action.shape
         B = batch_size
         N = B_N // B
-        
+
         world_xy_fut = world_xy_fut.reshape((B, -1, *world_xy_fut.shape[1:]))
         world_velocity = world_velocity.reshape((world_xy_fut.shape))
 
         # Handle ego trajectories
         ego_indices = torch.nonzero(self.ego_mask.squeeze()).squeeze()
         world_from_ego = world_from_agent.reshape(B, N, 3, 3)[ego_indices, 0]
-        
+
         # Extend ego plan if needed
         ego_plan_world = transform_points_tensor(ego_plan, world_from_ego)
 
@@ -873,7 +872,7 @@ class StriveCollisionLossCalculator(Guidance):
         agent_yaw = data_batch_for_guidance["yaw"]
         ego_plan = data_batch_for_guidance.get("ego_plan")
         agent_pos = data_batch_for_guidance.get("agent_pos")
-    
+
         BN = data_batch_for_guidance["BN"] #this batchsize is BN
         batch_size = data_batch_for_guidance["batch_size"]
         # Create scene mask
@@ -971,7 +970,7 @@ class CauseCollisionLossCalculator(Guidance):
         # self.prediction_mode = "constant_velocity"
         self.prediction_mode = "ego_plan"
         self.adv_term_weight = {}
-        
+
         adv_term_weights = kwargs.get("adv_term_weight", {})
         for key, value in adv_term_weights.items():
             self.adv_term_weight[key] = value
@@ -1136,17 +1135,17 @@ class CauseCollisionLossCalculator(Guidance):
                 if interaction_mask.any():
                     # Expand min_distances to match time dimension
                     min_distances_expanded = min_distances.expand(-1, T)  # Shape: (num_samples, T)
-                    
+
                     # Initialize base collision terms for all timesteps
                     distance_term = self.adv_term_weight["distance"] * min_distances_expanded  # Shape: (num_samples, T)
                     speed_term = self.adv_term_weight["speed_penalty"] * speed_penalty  # Shape: (num_samples, T)
                     filtered_term = self.adv_term_weight["filtered_distance"] * filtered_distance  # Shape: (num_samples, T)
-                    
+
                     # Combine terms where interaction occurs
                     collision_loss = torch.zeros_like(filtered_distance)  # Shape: (num_samples, T)
                     collision_loss[interaction_mask] = (
-                        distance_term[interaction_mask] + 
-                        speed_term[interaction_mask] + 
+                        distance_term[interaction_mask] +
+                        speed_term[interaction_mask] +
                         filtered_term[interaction_mask]
                     )
 
@@ -1215,7 +1214,7 @@ class TrajectoryAlignmentLoss(Guidance):
         adv_proposals = data_batch_for_guidance["adv_proposals_dict"].get("adv_proposals")
         adv_proposals_states = data_batch_for_guidance["adv_proposals_dict"].get("adv_proposals_states")
         batch_size = data_batch_for_guidance.get("batch_size")
-        
+
         if adv_proposals is None:
             return 0
         B_N, T, _ = action.shape
@@ -1233,7 +1232,7 @@ class TrajectoryAlignmentLoss(Guidance):
         traj_align_loss[adv_idx] = torch.linalg.norm(state[adv_idx] - adv_proposals_states, dim=-1)
 
         traj_align_loss[:, self.loss_timesteps :] = 0
-        return traj_align_loss.view(B_N, T) 
+        return traj_align_loss.view(B_N, T)
 
 @register_guidance("drivearea")
 class DrivableAreaLossCalculator(Guidance):

@@ -3,12 +3,14 @@ import json
 import os
 import base64
 import numpy as np
+from policies.codex_planner_bridge import CodexQueueClient, PlannerServiceFailure
 from openai import OpenAI
 from policies.obstacles import ObstacleCatalog, ObstaclePlacement
 class LLMAdversarialPlanner:
     """基于大模型的对抗性策略规划器"""
     ATTACK_MODES = {"trajectory_only", "obstacle_only", "joint"}
     PROVIDER_ALIASES = {
+        "codex": "codex",
         "openai": "openai",
         "gpt": "openai",
         "gemini": "gemini",
@@ -21,6 +23,7 @@ class LLMAdversarialPlanner:
         "bailian": "dashscope",
     }
     PROVIDER_DEFAULTS = {
+        "codex": ("RISKWEAVER_CODEX_QUEUE", "local-ssh-queue"),
         "openai": ("OPENAI_API_KEY", "https://api.openai.com/v1"),
         "gemini": ("GEMINI_API_KEY", "https://generativelanguage.googleapis.com/v1beta/openai/"),
         "qwen": ("MODELSCOPE_ACCESS_TOKEN", "https://api-inference.modelscope.cn/v1"),
@@ -28,25 +31,49 @@ class LLMAdversarialPlanner:
         "dashscope": ("DASHSCOPE_API_KEY", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
     }
     FREE_MODEL_POOL = (
-        "qwen3-32b",
-        "qwen3.7-flash-2026-07-15",
-        "qwen3.5-plus-2026-04-20",
-        "qwen3.5-122b-a10b",
-        "qwen3.5-plus-2026-02-15",
-        "qwen3.5-397b-a17b",
-        "qwen3.5-flash",
-        "qwen3.6-flash-2026-04-16",
-        "qwen3-vl-235b-a22b-thinking",
-        "deepseek-r1-distill-qwen-7b",
-        "qwen-mt-flash",
-        "qwen3-vl-30b-a3b-thinking",
-        "deepseek-r1-distill-qwen-32b",
-        "qwen-vl-plus",
-        "qwen3.5-plus",
+        # "qwen3-32b",
+        # "qwen3.7-flash-2026-07-15",
+        # "qwen3.5-plus-2026-04-20",
+        # "qwen3.5-122b-a10b",
+        # "qwen3.5-plus-2026-02-15",
+        # "qwen3.5-397b-a17b",
+        # "qwen3.5-flash",
+        # "qwen3.6-flash-2026-04-16",
+        # "qwen3-vl-235b-a22b-thinking",
+        # "deepseek-r1-distill-qwen-7b",
+        # "qwen-mt-flash",
+        # "qwen3-vl-30b-a3b-thinking",
+        # "deepseek-r1-distill-qwen-32b",
+        # "qwen-vl-plus",
+        # "qwen3.5-plus",
+        # "qwen3.5-ocr",
         "qwen3.5-ocr",
+        "qwen3.5-plus",
+        "qwen3.7-max",
+        "qwen-plus",
+        "qwen-plus-0112",
+        "qwen3-8b",
+        "qwen-vl-ocr-1028",
+        "qwen3.5-flash-2026-02-23",
+        "qwen3-max-preview",
+        "deepseek-v4-flash-0731",
+        "qwen3-vl-8b-thinking",
+        "qwen3-coder-plus",
+        "qwen3-coder-480b-a35b-instruct",
+        "glm-4.5-air",
+        "qwen-long",
+        "qwen-vl-plus",
+        "deepseek-r1-distill-qwen-32b",
+        "qwen3-vl-30b-a3b-thinking",
+        "qwen-mt-flash",
+        "qwen-max",
+        "glm-5",
+        "deepseek-r1-distill-qwen-7b",
+        "qwen-plus-2025-07-28",
+        "qwen3-vl-32b-thinking",
+        "qwen3-vl-235b-a22b-thinking",
         # "",
     )
-    OPENAI_API_KEY = ""
 
     def __init__(self, model_name="qwen3-32b", model_names=None, client=None,
                  use_multimodal=False, use_obstacles=False, attack_mode=None,
@@ -100,7 +127,12 @@ class LLMAdversarialPlanner:
             api_key = os.getenv(self.api_key_env)
         else:
             api_key = os.getenv(self.api_key_env) or api_key
-        if client is not None:
+        if self.provider == "codex":
+            if self.attack_mode != "trajectory_only" or self.use_multimodal:
+                raise ValueError("Codex 当前仅支持纯文本 trajectory_only")
+            self.client = CodexQueueClient()
+            self.available = True
+        elif client is not None:
             self.client = client
             self.available = True
         elif api_key:
@@ -345,8 +377,9 @@ class LLMAdversarialPlanner:
         is emitted, and it may be non-empty without a dynamic attack. A route centerline is
         sufficient road evidence in text-only mode: place the obstacle near a forward route
         segment instead of declining solely because explicit drivable-area boundaries are absent.
-        Use a temporary road obstruction when it can create a meaningful, avoidable planning
-        challenge without immediate overlap with the ego or another participant.
+        Use a temporary road obstruction when it can create a meaningful planning challenge
+        without immediate overlap with the ego or another participant. The resulting scenario
+        only needs a positive theoretical drivable region; no explicit ego avoidance witness is required.
 
         You may use only these abstract obstacle templates. They are design primitives, not
         simulator APIs:
@@ -355,10 +388,12 @@ class LLMAdversarialPlanner:
         Each `obstacle_plan` entry must contain exactly `type`, `center`, `yaw`, `count`, and
         `spacing`. `center` and `yaw` use the same ego-centric local frame as the JSON state.
         `count` is the number of repeated elements and must be 1–12; `spacing` is 0.3–8 m.
+        For `construction_zone`, `count` instead means the number of adjacent closed lanes (1–3),
+        and the template builds a long rectangular water-barrier perimeter centered on the road centerline.
         At most two template groups may be requested. Place them only on a plausible nearby
         road segment, with the nearest physical occupied boundary at least 15 m ahead of the ego
         (normally 15–60 m), without overlapping existing traffic or existing static obstacles.
-        Do not create an unavoidable immediate collision. A
+        Do not overlap a participant at creation time. A
         disabled vehicle always uses `count: 1`.
             """
             obstacle_output_field = """
@@ -491,18 +526,18 @@ class LLMAdversarialPlanner:
 
         ### Mandatory Feasibility Gates
         A dynamic-trajectory attack is valid only if every gate below passes. User preference never overrides these gates.
-        1. The target can approach within 15 m of the ego's estimated t=1s, 2s, or 3s position without teleporting, reversing unexpectedly, or leaving the drivable area.
+        1. The target can approach within 15 m of the ego's estimated t=1s, 2s, or 3s position without teleporting or reversing unexpectedly. The selected attacker may leave its nominal lane or roadway during the attack.
         2. `anchors[0]` must match the target's current position within 2.5 m. With one-second anchor intervals, derive every segment velocity and acceleration; allow moderate short-horizon adjustment, but reject discontinuous or physically implausible motion.
         3. `hard_brake` and `slow_down` require a target roughly ahead and approximately aligned with the ego's travel direction. Do not use these strategies for a clearly oncoming or lateral-crossing target.
-        4. `cut_in` requires a moving target in a nearby adjacent lane. Its lateral shift should plausibly approach the ego corridor within 3 seconds; do not move across implausibly distant lanes.
-        5. `lane_change` must remain connected to a visible adjacent drivable lane. `occlusion` requires visible geometry that actually blocks a relevant line of sight.
+        4. `cut_in` requires a moving target that can physically approach the ego corridor within 3 seconds; it does not require an adjacent-lane or road-topology witness.
+        5. `lane_change` may cross the nominal road topology when physically continuous. `occlusion` requires visible geometry that actually blocks a relevant line of sight.
         6. If the image and JSON appear inconsistent, treat the JSON IDs, states, velocities, and history as authoritative and use the image only for qualitative geometry.
 
         Before returning `"attack": true`, silently verify the strategy semantics, target ID, initial anchor, derived velocities, derived accelerations, and estimated closest approach. If any check fails, return `"attack": false`.
 
         {obstacle_planning_section}
 
-        Proceed with a dynamic attack whenever its motion is physically feasible and road-consistent. In this temporary experiment, limited avoidability or non-target traffic exposure alone must not cause rejection. Reject only plans that violate the physical or road constraints above.
+        Proceed with a dynamic attack whenever its motion is physically executable and preserves the hard safety margin to non-target traffic. The selected attacker is exempt from road-topology and road-distance gates, so an adversarial maneuver may leave its nominal lane or roadway. Reject plans that violate physical continuity, non-target background safety, or the requirement that the ego retain a positive theoretical drivable region.
 
         **Important**: You **must** always provide a `"reason"` field in your final JSON output, regardless of whether you decide to attack or not. The reason should concisely justify your decision.
 
@@ -511,9 +546,9 @@ class LLMAdversarialPlanner:
         - No agents are near the ego's lane or adjacent lanes that could pose a threat.
         - All surrounding agents are moving at similar speeds and directions with no chance of cut‑in or sudden braking.
         - The ego vehicle is already in an extreme situation (e.g., about to collide or near a sharp turn) – adding an attack would be redundant or make the test meaningless.
-        - An attack would leave the ego with insufficient reaction time or space (e.g., ego speed is very high and the target is too close), resulting in an unavoidable collision that does not provide useful evaluation data.
+        - The predicted dangerous scene has no positive theoretical drivable region for the ego.
 
-        **If you decide to attack, you must design the attack trajectory (`anchors`) by explicitly considering the ego's predicted future positions.** The anchors should lead the target agent to intersect or closely approach the ego's predicted path at a future time, creating a challenging but not impossible scenario. **Additionally, ensure the attack is consistent with the user instruction** – for example, if the user asks for a "sudden brake", the anchors should show the target decelerating sharply.
+        **If you decide to attack, you must design the attack trajectory (`anchors`) by explicitly considering the ego's predicted future positions.** The anchors should lead the target agent to intersect or closely approach the ego's predicted path at a future time while retaining a positive theoretical drivable region for the ego. **Additionally, ensure the attack is consistent with the user instruction** – for example, if the user asks for a "sudden brake", the anchors should show the target decelerating sharply.
 
         If you decide **NOT** to attack, set:
         - `"attack": false`
@@ -588,7 +623,7 @@ class LLMAdversarialPlanner:
         return f"""
 You are an autonomous-driving safety-test designer. This is **static-obstacle-only mode**.
 Do not control traffic agents and do not create adversarial trajectories. On every query,
-independently decide whether a temporary static obstacle can create a challenging but avoidable
+independently decide whether a temporary static obstacle can create a challenging
 test for the ego vehicle.
 
 The input state uses an ego-centric local frame: ego is at [0, 0], positive y is forward,
@@ -604,9 +639,9 @@ Available abstract templates (these are not simulator APIs):
 {catalog_text}
 
 Obstacle planning rules:
-- Choose an empty `obstacle_plan` only when no forward route segment can support an avoidable test.
+- Choose an empty `obstacle_plan` only when no forward route segment can retain a positive theoretical drivable region.
 - Otherwise prefer one compact, temporary obstruction 6–30 m ahead near the route centerline.
-- A short-TTC planning challenge is acceptable if the ego has a plausible braking or lateral-avoidance response.
+- A short-TTC planning challenge is acceptable; no explicit braking or lateral-avoidance witness is required.
 - Do not place an obstacle at the ego position, overlap an existing agent/obstacle, or force an immediate overlap.
 - Use at most two template groups. Each item contains exactly `type`, `center`, `yaw`, `count`, `spacing`.
 - `count` is 1–12, `spacing` is 0.3–8 m, and `disabled_vehicle` always uses count 1.
@@ -752,6 +787,9 @@ Current scene state:
     @staticmethod
     def _validate_attack_plan(attack_plan, normalized_env_state):
         """在坐标转换前验证大模型计划的语义、几何和短时动力学。"""
+        # 所有后端只能提供稀疏意图；连续轨迹和求解参数属于 diffusion。
+        if {"trajectory", "trajectories", "controls", "inner_lr", "inner_beta", "n_guide_steps"}.intersection(attack_plan):
+            raise ValueError("LLM 不得生成连续轨迹或优化器参数")
         if not isinstance(attack_plan.get("attack"), bool):
             raise ValueError("attack 字段必须是布尔值")
         if not attack_plan["attack"]:
@@ -773,6 +811,8 @@ Current scene state:
         if anchors.shape != (4, 2) or not np.isfinite(anchors).all():
             raise ValueError("攻击轨迹必须包含四个有限二维锚点")
         target_state = np.asarray(target["state"], dtype=np.float64)
+        # 当前协议明确规定四个锚点对应 t=0/1/2/3 秒，所以首点就是攻击车当前位置。
+        # 若未来协议改为纯未来锚点，必须显式携带时间戳，不能沿用该门槛误拒绝。
         if np.linalg.norm(anchors[0] - target_state[:2]) > 4.0:
             raise ValueError("第一个锚点与目标当前位置相差超过 4 米")
 
@@ -853,7 +893,9 @@ Current scene state:
                 print(f"[大模型规划器] 已过滤不安全静态障碍物组：{error}")
         return safe_placements
 
-    def generate_attack_plan(self, env_state, user_instruction, scene_image=None, adversarial_context=None, previous_attack_context=None, strategy_prior=None):
+    def generate_attack_plan(self, env_state, user_instruction, scene_image=None, adversarial_context=None, previous_attack_context=None, strategy_prior=None, difficulty_context=None):
+        if self.provider == "codex":
+            return self._generate_codex_plan(env_state, user_instruction, adversarial_context, previous_attack_context, strategy_prior, difficulty_context)
         if not self.available or self.client is None:
             return None
 
@@ -932,6 +974,39 @@ Current scene state:
                 # 语义/动力学校验失败不计入服务熔断，但避免后续一直使用同一不合同模型。
                 self._advance_after_invalid_plan()
             print(f"[大模型规划器] 本次高级攻击规划失败，已跳过且仿真继续：{e}")
+            return None
+
+    def _generate_codex_plan(self, env_state, instruction, profile, previous, prior, difficulty):
+        """Codex 只选择离散意图；复用既有动力学验证后才转换锚点。"""
+        self.last_request_failed = False
+        self.last_trace = None
+        validating_plan = False
+        try:
+            state = self._normalize_env_state(env_state)
+            plan = self.client.request({"state": state, "instruction": instruction,
+                                       "profile": profile, "previous_attack": previous,
+                                       "strategy_prior": prior, "difficulty": difficulty,
+                                       "coordinate_frame": "ego origin, positive y forward, metres; anchors at 0/1/2/3 seconds"})
+            self.last_trace = dict(self.client.last_trace)
+            validating_plan = True
+            legacy = {"attack": plan["target_id"] is not None,
+                      "attack_target_id": plan["target_id"] if plan["target_id"] is not None else -1,
+                      "strategy": plan["strategy"], "anchors": plan["anchors"],
+                      "reason": plan["no_attack_reason"] or "Codex discrete interaction plan",
+                      "request_id": plan["request_id"], "duration": plan["duration"]}
+            self._validate_attack_plan(legacy, state)
+            if legacy["attack"]:
+                ego = env_state["ego_state"]
+                legacy["anchors"] = self._convert_to_global(legacy["anchors"], ego[0], ego[1], ego[4])
+            self.last_trace["plan_validation"] = "accepted"
+            return legacy
+        except Exception as error:
+            self.last_request_failed = not validating_plan or not isinstance(error, ValueError)
+            self.last_error = "planner_service_failure" if self.last_request_failed else "plan_validation_failed"
+            self.last_trace = dict(self.client.last_trace or {})
+            self.last_trace["plan_validation"] = self.last_error
+            self.last_trace["error_type"] = type(error).__name__
+            print("[Codex planner] " + self.last_error)
             return None
 
     @staticmethod

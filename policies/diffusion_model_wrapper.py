@@ -12,6 +12,7 @@ import numpy as np
 
 from policies.safe_sim_adapter import SafeSimBatchAdapter
 from policies.traffic_types import JointTrajectory, ScenarioFrame
+from policies.joint_safety import safe_joint_candidates, NoSafeJointCandidate
 
 
 def _move_to_device(value, device):
@@ -628,6 +629,25 @@ class DiffusionModelWrapper:
                     match = -lateral if exploit == "forward_pressure" else (lateral if exploit == "cut_in_or_lateral_conflict" else forward)
                     joint_scores = joint_scores - 0.05 * match
             joint_scores[0] = torch.inf
+            raw_scores = joint_scores.detach().cpu().numpy().copy()
+            # 软损失最优仍可能碰撞，联合候选需再按真实 OBB 占用复核。
+            safe = safe_joint_candidates(
+                positions.detach().cpu().numpy(), yaws.detach().cpu().numpy(),
+                guidance_data["world_from_agent"].detach().cpu().numpy(),
+                guidance_data["ego_extents"].detach().cpu().numpy(),
+            )
+            joint_scores[~torch.as_tensor(safe,device=joint_scores.device)] = torch.inf
+            if not bool(torch.isfinite(joint_scores).any()):
+                # 仅失败时冻结非敏感几何数据，便于离线复核坐标与碰撞根因。
+                diagnostic_dir = os.environ.get("RISKWEAVER_DIAGNOSTIC_DIR")
+                if diagnostic_dir:
+                    Path(diagnostic_dir).mkdir(parents=True, exist_ok=True)
+                    np.savez_compressed(Path(diagnostic_dir) / f"joint_rejection_{time.time_ns()}.npz",
+                        positions=positions.detach().cpu().numpy(), yaws=yaws.detach().cpu().numpy(),
+                        transforms=guidance_data["world_from_agent"].detach().cpu().numpy(),
+                        extents=guidance_data["ego_extents"].detach().cpu().numpy(),
+                        scores=raw_scores, safe=safe)
+                raise NoSafeJointCandidate(f"联合候选拒绝：几何安全={int(safe[1:].sum())}/{num_samples-1}，有限评分={int(np.isfinite(raw_scores[1:]).sum())}/{num_samples-1}")
             selected_index = int(torch.argmin(joint_scores).item())
 
         selected_action = type(action)(
@@ -696,6 +716,11 @@ class DiffusionModelWrapper:
         model_batch["guidance_attack_active"] = attack_active
         # LLM 指定的攻击车允许离开道路；其他交通参与者仍受 route 损失约束。
         model_batch["guidance_route_exempt_mask"] = attack_active
+        if attack_intent is not None and attack_intent.get('profile_guided'):
+            # 保留攻击者道路引导豁免和接触阶段；画像仅增加 TTC 区间目标。
+            model_batch['profile_guided'] = torch.ones_like(attack_active)
+            band = attack_intent['ttc_range_s']
+            model_batch['profile_ttc_band'] = torch.tensor(band,dtype=torch.float32).repeat(len(attack_active),1)
         model_batch["guidance_attack_age_frames"] = torch.full(
             (len(safe_batch.row_to_agent_id),),
             attack_age_frames,
@@ -750,6 +775,23 @@ class DiffusionModelWrapper:
         positions_local = action.positions.detach().cpu().numpy()
         yaws_local = action.yaws.detach().cpu().numpy()
         joint = self.adapter.decode(frame, safe_batch, positions_local, yaws_local)
+        # 可选冻结全部联合样本，离线定位具体车辆、时刻和动力学拒绝原因。
+        diagnostic_dir = os.environ.get("RISKWEAVER_JOINT_DIAGNOSTIC_DIR")
+        diagnostic_samples = info.get("action_samples") if isinstance(info, dict) else None
+        if diagnostic_dir and isinstance(diagnostic_samples, dict):
+            diagnostic_positions = diagnostic_samples.get("positions")
+            diagnostic_yaws = diagnostic_samples.get("yaws")
+            if diagnostic_positions is not None and diagnostic_yaws is not None:
+                decoded = [self.adapter.decode(frame, safe_batch,
+                           diagnostic_positions[:, index].detach().cpu().numpy(),
+                           diagnostic_yaws[:, index].detach().cpu().numpy())
+                           for index in range(diagnostic_positions.shape[1])]
+                Path(diagnostic_dir).mkdir(parents=True, exist_ok=True)
+                np.savez_compressed(Path(diagnostic_dir) / f"joint_{frame.step}_{time.time_ns()}.npz",
+                    positions=np.stack([candidate.positions_global for candidate in decoded]),
+                    agent_ids=joint.agent_ids, states=frame.states_global, dt=frame.dt,
+                    selected_index=-1 if joint_sample_index is None else joint_sample_index,
+                    source_step=frame.step)
         candidate_trajectories_global = []
         # 将攻击目标的每个扩散候选样本解码到全局坐标，供可视化显示；不参与控制决策。
         samples = info.get("action_samples") if isinstance(info, dict) else None
@@ -801,6 +843,8 @@ class DiffusionModelWrapper:
                 "adversarial_guidance_active": target_id is not None,
                 "adversarial_guidance_target_id": target_id,
                 "attack_age_frames": attack_age_frames,
+                "planner_request_id": attack_intent.get("request_id") if attack_intent else None,
+                "planner_strategy": attack_intent.get("strategy") if attack_intent else None,
                 "anchor_guidance_enabled": self.uses_anchor_guidance,
                 "anchor_guidance_active": anchor_metadata["active"],
                 "anchor_guidance_target_id": anchor_metadata["target_id"],

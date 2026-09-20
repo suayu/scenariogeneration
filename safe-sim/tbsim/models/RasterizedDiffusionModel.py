@@ -42,7 +42,7 @@ class RasterizedDiffusionModel(nn.Module):
             do_guidance = False,
             guide_config = None,
     ) -> None:
-    
+
         super().__init__()
         if rasterize_mode is None:
             rasterize_mode = "point"
@@ -64,7 +64,7 @@ class RasterizedDiffusionModel(nn.Module):
         # 历史轨迹编码器：对自车历史和邻居历史分别编码
         self.agent_history_encoder = base_models.HistoryEncoder(history_encoder_config)
         self.other_history_encoder =  base_models.HistoryEncoder(history_encoder_config)
-        
+
         self.diffnet = TemporalUnet(**diffnet_config,dynamics_config=dynamics_config) ##TODO config of TemperalNet
         # 扩散采样器
         self.diffusion = DiffusionTraj(
@@ -112,8 +112,8 @@ class RasterizedDiffusionModel(nn.Module):
             data_batch_for_guidance=data_batch_for_guidance,
             current_states=curr_states,
             guide_config=self.guide_config,  # guide_config for controllable simulation
-            adv_proposals_dict=(data_batch["adv_proposals_dict"] 
-                              if "adv_proposals_dict" in data_batch 
+            adv_proposals_dict=(data_batch["adv_proposals_dict"]
+                              if "adv_proposals_dict" in data_batch
                               else None),  # B * 20 * 12 * 2
             **self.diffuse_args.to_dict(),
         )
@@ -141,7 +141,7 @@ class RasterizedDiffusionModel(nn.Module):
             raise NotImplementedError
 
         return out_dict
-       
+
     def update_guide_config(self, update_guide_config, device):
         update_config(self.guide_config, update_guide_config.guide_config)
         self.Loss_Calculater.to_device(device)
@@ -158,10 +158,10 @@ class RasterizedDiffusionModel(nn.Module):
         """
         if not self.do_guidance:
             return self.forward(data_batch, guide_sample_fn=None)
-        
+
         # 准备引导数据（距离图、车道信息等）
         data_batch_for_guidance = self._prepare_guidance_data(data_batch)
-        
+
         # 若需要生成对抗轨迹（partial diffusion）
         if self.gen_adv_trajs:
             adv_proposals_dict = generate_collision_paths(
@@ -175,29 +175,29 @@ class RasterizedDiffusionModel(nn.Module):
                 dt=data_batch["dt"][0].item()
             )
             data_batch_for_guidance.update(adv_proposals_dict)
-        
+
         # Run forward pass with guidance
         out_dict = self.forward(
             data_batch,
             guide_sample_fn=self.Loss_Calculater,
             data_batch_for_guidance=data_batch_for_guidance
         )
-        
+
         return out_dict
 
     def _prepare_guidance_data(self, data_batch) -> Dict:
         """Prepare data needed for guided sampling.
-        
+
         Args:
             data_batch (Dict): Input batch containing scene and agent information
-            
+
         Returns:
             Dict: Processed data batch for guidance
         """
         # Calculate drivable region and distance maps
         drivable_map = batch_utils().get_drivable_region_map(data_batch["image"]).float()
         dis_map = GeoUtils.calc_distance_map(drivable_map)
-        
+
         # Calculate batch dimensions
         batch_size = data_batch["dt"].shape[0]
         BN = batch_size * self.diffuse_args["num_samples"]
@@ -228,6 +228,10 @@ class RasterizedDiffusionModel(nn.Module):
             guidance_data["scenario_ego_state"] = data_batch["scenario_ego_state"]
         if "guidance_target_mask" in data_batch:
             guidance_data["guidance_target_mask"] = data_batch["guidance_target_mask"]
+        # 画像目标贯穿采样损失与联合评分，避免模型数据准备静默丢弃安全语义。
+        for key in ('profile_guided', 'profile_ttc_band'):
+            if key in data_batch:
+                guidance_data[key] = data_batch[key]
         # 仅让 LLM 指定的攻击车跳过道路损失，其余车辆保持道路可行性。
         if "guidance_route_exempt_mask" in data_batch:
             guidance_data["guidance_route_exempt_mask"] = data_batch[
@@ -255,19 +259,19 @@ class RasterizedDiffusionModel(nn.Module):
 
         # Adjust shapes for batch processing
         self._adjust_batch_shapes(guidance_data, batch_size)
-        
+
         return guidance_data
 
     def _adjust_batch_shapes(self, guidance_data: Dict, batch_size: int):
         """Adjust shapes of guidance data for batch processing.
-        
+
         Args:
             guidance_data (Dict): Data to be adjusted
             batch_size (int): Base batch size
         """
         keys_to_adjust = ["centerline", "lane_avail", "world_from_agent", "yaw", "raster_from_agent", "dis_map", "static_obstacles_world", "static_obstacle_mask"]
         keys_to_adjust = [key for key in keys_to_adjust if key in guidance_data]
-        
+
         for key in keys_to_adjust:
             guidance_data[key] = enlarge_batch_samples(
                 guidance_data[key],
@@ -281,7 +285,7 @@ class RasterizedDiffusionModel(nn.Module):
                 target_length=self.diffuse_args["num_points"]
             )
 
-    
+
     def _forward_dynamics(self,actions,curr_states) -> Dict[str,torch.Tensor]:
         """将控制信号 actions 通过动力学模型转换为轨迹（位置+朝向）。"""
         #TODO if actions is more than 1 sample, need to do in batch
@@ -291,7 +295,7 @@ class RasterizedDiffusionModel(nn.Module):
             traj, x    =  self.diffusion.net._forward_dynamics(actions=actions, current_states=curr_states)
         pred_positions = traj[..., :2]
         pred_yaws = traj[..., 2:]
-        
+
         out_dict = {
             "states": x,
             "controls": actions,

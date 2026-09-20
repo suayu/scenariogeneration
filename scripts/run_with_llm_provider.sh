@@ -7,12 +7,16 @@ shift
 # 调用命令显式传入的模型名优先于持久配置，避免切换 provider 时继承旧模型名。
 requested_model_name="${LLM_MODEL_NAME:-}"
 env_file="${SCENARIO_DREAMER_LLM_ENV:-$HOME/.config/scenario-dreamer/llm.env}"
-if [[ -f "$env_file" ]]; then
+if [[ "$provider" != "codex" && -f "$env_file" ]]; then
   # shellcheck disable=SC1090
   source "$env_file"
 fi
 
 case "$provider" in
+  codex)
+    # 本机工作器复用 ChatGPT 登录；远端不读取 API 或 Codex 凭据。
+    export LLM_MODEL_NAME="codex-local"
+    ;;
   openai)
     : "${OPENAI_API_KEY:?请先在 $env_file 设置 OPENAI_API_KEY}"
     export LLM_MODEL_NAME="${requested_model_name:-gpt-5.6}"
@@ -35,7 +39,7 @@ case "$provider" in
     ;;
   dashscope)
     : "${DASHSCOPE_API_KEY:?请先在 $env_file 设置 DASHSCOPE_API_KEY}"
-    export LLM_MODEL_NAME="${requested_model_name:-qwen3.7-plus}"
+    export LLM_MODEL_NAME="${requested_model_name:-qwen3.5-plus}"
     ;;
   *)
     echo "不支持的提供方：$provider" >&2

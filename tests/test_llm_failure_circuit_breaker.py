@@ -37,12 +37,15 @@ def test_llm_service_failure_disables_attacks_after_configured_retries():
     planner = _UnavailablePlanner()
     generator = AdversarialScenarioGenerator(cfg, [], llm_planner=planner)
     generator._ignore_call_times = 0
+    # 本测试仅隔离服务熔断；可达性由独立集成测试覆盖。
+    generator.risk_metrics.reachability_enabled = False
     environment = _MinimalEnvironment()
 
     for step in (12, 16, 20, 24):
         environment.current_step = step
         assert generator.step(environment, step) is True
 
+    assert generator._episode_planner_service_failures == 3
     assert planner.call_count == 3
     assert generator._consecutive_llm_failures == 3
     assert generator._attacks_enabled is False

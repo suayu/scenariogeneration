@@ -3,9 +3,20 @@ mode: scenario_dreamer # [waymo_ctrl_sim, waymo_log_replay, scenario_dreamer]
 dataset_path: ${project_root}/metadata/simulation_environment_datasets/scenario_dreamer_waymo_200m_pickles # path to set of simulation environments
 json_path: ${project_root}/metadata/simulation_environment_datasets/scenario_dreamer_waymo_200m_jsons # path to the json files
 policy: idm # or rl (policy being evaluated)
+# 画像由 traffic_model.iterative_adversarial.profile_enabled 单独启用完整链路。
+ego_profile:
+  policy_id: "" # 建议填写策略+检查点内容版本；空值使用策略与检查点路径标识
+  alpha: 0.05 # 指数滑动统计更新系数
+  reservoir_size: 2048 # 全程均匀抽样估计分位数，不改变仿真随机数流
+  block_frames: 20 # 分块均值置信区间；至少八块，相关性仍需实验评估
+  history_paths: [] # 只读历史 strategy_returns.jsonl，实验划分间禁止混用
+  background_margin_m: 0.5
+  lane_half_width_m: 1.8 # 无道路边界时的保守中心线走廊近似
+  ttc_range_s: [1.0, 4.0] # 追求可规避但反应余量小的交互
+  low_speed_decelerations_mps2: [] # 默认关闭；实验可显式添加低速减速锚点，仍接受完整候选安全筛查
 rl_model_path: ${project_root}/metadata/gpudrive_checkpoint # path to the RL model
 rl_model_name: pretrained # name of the RL model
-polyline_reduction_threshold: 0.1 # from gpudrive 
+polyline_reduction_threshold: 0.1 # from gpudrive
 visualize: False # create videos of the simulation?
 lightweight: False # lightweight visualization (runs faster, less dpi and lower frame rate)
 movie_path: ${project_root}/movies # path to save visualization movies
@@ -27,6 +38,11 @@ behaviour_model:
   predict_rtgs: True # whether behaviour model predicts return-to-go
   compute_metrics: False # compute metrics for behaviour model?
 traffic_model:
+  # 可选公共连续修正；四组比较使用相同设置，默认保持原路径。
+  dynamics_projection:
+    enabled: false
+    max_deviation_m: 0.25
+    max_seconds_per_vehicle: 2.0
   backend: safe_sim_diffusion # 可选后端：safe_sim_diffusion、ctrl_sim、log_replay
   safe_sim_root: ${project_root}/safe-sim
   config_path: ${sim.traffic_model.safe_sim_root}/safesim_checkpoints/safesim_fut32/test/run0/config.json
@@ -49,7 +65,9 @@ traffic_model:
   iterative_adversarial:
     profile_enabled: false
     escalation_enabled: false
-    full_method_enabled: false # 仅在轨迹迭代开启时叠加 CAT 记忆与候选画像匹配
+    full_method_enabled: false # 旧增强模式；画像开启后完整链路不依赖此开关
+  attack_route_weight: null # 默认关闭；仅攻击窗口提高非目标背景车的道路软引导，硬门槛保持原值
+  attack_route_lane_margin: null # 默认关闭；仅攻击窗口收紧 route loss 的车体中心余量
   guidance:
     # 启动时只需覆盖 mode：unguided、default、llm_joint、manual。
     mode: unguided
@@ -78,8 +96,9 @@ traffic_model:
       scenario_collision:
         safety_margin: 0.5
         temperature: 0.5
-        loss_timesteps: 20
-        filter_timesteps: 20
+        # 覆盖全部预测点，与联合安全复核保持一致，避免尾段无引导。
+        loss_timesteps: ${sim.traffic_model.prediction_horizon}
+        filter_timesteps: ${sim.traffic_model.prediction_horizon}
         loss_scale: 1.0
         attack_protection_frames: 2 # LLM 发起攻击后的第 0–1 帧完整保持攻击者—自车安全间距
         attack_relaxation_frames: 6 # 第 2–7 帧线性减弱安全间距约束，第 7 帧降为零
@@ -89,11 +108,11 @@ traffic_model:
         contact_loss_scale: 1.0 # 末段受控接触损失强度
         penetration_loss_scale: 5.0 # 深度穿透惩罚强度
         safety_penetration_loss_scale: 100.0 # 背景车互撞和非攻击车撞自车的强穿透屏障
-        background_pair_penetration_loss_scale: 1000.0 # 基于 OBB 穿透深度的强屏障，避免非目标交通互撞
-        background_pair_safety_loss_scale: 5.0 # 基于 OBB 占用边界的提前避让损失强度
+        background_pair_penetration_loss_scale: 2000.0 # 基于 OBB 穿透深度的强屏障，避免非目标交通互撞
+        background_pair_safety_loss_scale: 50.0 # 增强边界接近阶段的梯度，不能仅依赖穿透后惩罚
         max_speed: 20.0 # 所有背景车辆允许的最大速度，单位为米每秒
         max_acceleration: 6.0 # 所有背景车辆允许的最大加速度模长，单位为米每二次方秒
-        max_jerk: 12.0 # 所有背景车辆允许的最大加加速度模长，单位为米每三次方秒
+        max_jerk: 20.0 # 非历史攻击车允许的最大加加速度模长，单位为米每三次方秒
         max_step_distance: 2.0 # 单帧最大位移，单位为米，用于直接拦截瞬移
         kinematics_loss_scale: 1.0 # 运动学异常惩罚强度
       route:
@@ -126,11 +145,17 @@ traffic_model:
     guide_steps: 1 # 每个反向扩散步执行的引导更新次数
     scale_grad_by_std: True # 按当前扩散噪声方差缩放梯度
 llm:
-  # 可选 openai、gemini、deepseek、dashscope、qwen；密钥仅从统一环境文件读取。
-  provider: openai
-  model_name: gpt-5.6 # OpenAI 建议使用 Responses API；可改为 gpt-5.6-terra 控制成本
+  # 四组消融只切换此参数；single 完整沿用当前调用流程。
+  multiagent:
+    mode: single # single / conditional_critic / parallel_arbiter / parallel_memory
+    timeout_seconds: 60
+    memory_path: null # 仅 parallel_memory 读取冻结的离线复盘知识库
+  # 默认百炼文本模型；实验中固定单模型，不自动轮换以免混入模型差异。
+  provider: dashscope
+  model_name: qwen3.5-plus
   model_names:
-    - gpt-5.6
+    - qwen3.5-plus
+  max_planning_calls: 30 # 实验按组固定调用预算，不随画像开关变化
   multimodal: False # False 为纯文本模式；True 为当前帧图像加结构化场景数据
   attack_mode: trajectory_only # trajectory_only、obstacle_only、joint；决定每次查询允许的攻击类型
   max_consecutive_failures: 3 # 连续服务/API失败达到该次数后，本场景不再调用 LLM
@@ -145,10 +170,29 @@ evaluation:
   # 单一模式开关：off 不迭代；adaptive 自动增减；target 向批量目标难度收敛。
   difficulty_control:
     mode: "off"
-    target_difficulty: 0.75
+    target_difficulty: 0.50
     tolerance: 0.10
     max_replays: 2 # 初次生成未命中目标区间时，最多从场景起点完整重放两次
     ability_progress_alpha: 0.15
+    # 废弃 ability_progress_alpha；能力分统一使用 autonomous_driving.partial_progress_coefficient。
+    reachability_every_queries: 3
+    smoke_acceptance: false # 冒烟时置 true；验收失败禁止进入正式实验。
+    controller:
+      initial_intensity: 0.5
+      gain: 0.5
+      max_step: 0.15
+      collision_step: 0.15
+      # 仅攻击权重连续插值；求解器参数在一次实验中固定。
+      fixed_optimizer:
+        inner_lr: 0.14
+        inner_beta: 0.35
+        n_guide_steps: 3
+      bounds:
+        llm_anchor: [0.5, 6.0]
+        scenario_ttc: [0.0, 3.0]
+        inner_lr: [0.03, 0.25]
+        inner_beta: [0.10, 0.60]
+        n_guide_steps: [2, 4]
   composite:
     # 各项先归一化到零到一，再按有效权重重新归一化并求加权平均。
     weights:

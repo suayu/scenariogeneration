@@ -253,6 +253,44 @@ class ConstructionBlockTemplate(ObstacleTemplate):
         return obstacles + ConeLineTemplate().materialize(cone_request, new_id)
 
 
+class ConstructionZoneTemplate(ObstacleTemplate):
+    """用细长水马围成长矩形，表示沿道路中心线封闭的施工路段。"""
+
+    type_name = "construction_zone"
+    description = "施工路段：细长水马围成长矩形；count 表示封闭车道数（1–3），中心位于道路中心线"
+
+    def materialize(self, placement, new_id):
+        lane_count = placement.count
+        if lane_count > 3:
+            raise ValueError("construction_zone 的 count 表示车道数，必须在 1 到 3 之间")
+        lane_width = 3.5
+        zone_length = max(12.0, 4.0 * placement.spacing)
+        zone_width = lane_count * lane_width
+        longitudinal_count = max(4, int(math.ceil(zone_length / 1.5)) + 1)
+        lateral_count = max(3, int(math.ceil(zone_width / 1.2)) + 1)
+        obstacles = []
+
+        def add(center, yaw):
+            obstacles.append(StaticObstacle(
+                obstacle_id=new_id(self.type_name), primitive_type=self.type_name,
+                object_kind="barrier", center_global=center, yaw=yaw,
+                length=1.2, width=0.35, height=0.9,
+                metadata={"shape": "construction_zone_perimeter", "lane_count": lane_count},
+            ))
+
+        # 两条长边沿道路方向，两条短边横跨被封闭车道，形成近似矩形占用区。
+        for side in (-1.0, 1.0):
+            edge = self._offset(placement.center, placement.yaw, side * zone_width / 2, lateral=True)
+            for offset in np.linspace(-zone_length / 2, zone_length / 2, longitudinal_count):
+                add(self._offset(edge, placement.yaw, float(offset)), placement.yaw)
+        for end in (-1.0, 1.0):
+            edge = self._offset(placement.center, placement.yaw, end * zone_length / 2)
+            for offset in np.linspace(-zone_width / 2, zone_width / 2, lateral_count):
+                add(self._offset(edge, placement.yaw, float(offset), lateral=True),
+                    placement.yaw + math.pi / 2)
+        return obstacles
+
+
 class ObstacleCatalog:
     """障碍物模板注册表，负责限制大模型可使用的类型集合。"""
 
@@ -264,6 +302,7 @@ class ObstacleCatalog:
             DisabledVehicleTemplate(),
             DebrisClusterTemplate(),
             ConstructionBlockTemplate(),
+            ConstructionZoneTemplate(),
         )
         self._templates = {template.type_name: template for template in templates}
 
