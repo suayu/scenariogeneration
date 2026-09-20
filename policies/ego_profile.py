@@ -241,7 +241,7 @@ class CandidateBuilder:
     def __init__(self, settings):
         self.margin = float(getattr(settings,'background_margin_m',.5))
         self.half_width = float(getattr(settings,'lane_half_width_m',1.8))
-        self.ttc_range = tuple(getattr(settings,'ttc_range_s',(1.,4.)))
+        self.ttc_range = tuple(getattr(settings,'ttc_range_s',(1.,5.)))
         # 默认无低速模板；实验显式启用时仍须经过完整道路、背景和规避筛查。
         self.low_speed_decelerations = tuple(float(x) for x in getattr(settings,'low_speed_decelerations_mps2',()))
         if self.margin < 0 or self.half_width <= 0 or len(self.ttc_range)!=2 or not 0 < self.ttc_range[0] < self.ttc_range[1]:

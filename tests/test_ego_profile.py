@@ -108,7 +108,7 @@ def test_candidate_has_required_explanations():
     assert {'estimated_risk','avoidability','background_safety_margin_m','profile_match','vulnerability'}<=set(candidate)
     assert candidate['avoidability']==dict(witness=None,
         requirement='theoretical_drivable_area_must_remain_positive')
-    assert 1<=candidate['estimated_ttc_s']<=4
+    assert 1<=candidate['estimated_ttc_s']<=5
     assert candidate['profile_evidence_frames']==0
 
 

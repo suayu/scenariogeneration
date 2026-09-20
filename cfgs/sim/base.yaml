@@ -12,7 +12,7 @@ ego_profile:
   history_paths: [] # 只读历史 strategy_returns.jsonl，实验划分间禁止混用
   background_margin_m: 0.5
   lane_half_width_m: 1.8 # 无道路边界时的保守中心线走廊近似
-  ttc_range_s: [1.0, 4.0] # 追求可规避但反应余量小的交互
+  ttc_range_s: [1.0, 5.0] # 追求可规避但反应余量小的交互
   low_speed_decelerations_mps2: [] # 默认关闭；实验可显式添加低速减速锚点，仍接受完整候选安全筛查
 rl_model_path: ${project_root}/metadata/gpudrive_checkpoint # path to the RL model
 rl_model_name: pretrained # name of the RL model
