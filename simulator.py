@@ -44,6 +44,17 @@ from policies.joint_safety import validate_execution_prefix
 MAX_RTG_VAL = 349
 
 
+def normalize_llm_model_names(llm_cfg, configured_model_name):
+    """保留空候选池的默认语义，并复制显式候选列表。"""
+    if llm_cfg is None:
+        return None
+    configured = llm_cfg.get('model_names', None)
+    if configured is None:
+        return None
+    names = [str(name) for name in configured if str(name)]
+    return names or [configured_model_name]
+
+
 class Simulator:
     """ We implement our own simple simulator for testing planners.
 
@@ -104,6 +115,9 @@ class Simulator:
                 anchor_max_update=0.5 if anchor_cfg is None else anchor_cfg.max_update,
                 anchor_guide_steps=1 if anchor_cfg is None else anchor_cfg.guide_steps,
                 anchor_scale_grad_by_std=True if anchor_cfg is None else anchor_cfg.scale_grad_by_std,
+                anchor_drive_enabled=False if anchor_cfg is None else anchor_cfg.get('anchor_drive_enabled', False),
+                anchor_phase_weights=(0.75, 1.25, 1.75) if anchor_cfg is None else anchor_cfg.get('phase_weights', [0.75, 1.25, 1.75]),
+                anchor_candidate_score_weight=0.25 if anchor_cfg is None else anchor_cfg.get('candidate_score_weight', 0.25),
                 capture_candidate_trajectories=bool(
                     self.cfg.sim.get('visualization', {}).get('show_diffusion_candidates', False)
                 ),
@@ -141,8 +155,8 @@ class Simulator:
         elif environment_model_name:
             llm_model_names = [environment_model_name]
         else:
-            llm_model_names = None if llm_cfg is None else list(
-                llm_cfg.get('model_names', [configured_model_name])
+            llm_model_names = normalize_llm_model_names(
+                llm_cfg, configured_model_name
             )
         use_multimodal = False if llm_cfg is None else bool(llm_cfg.multimodal)
         attack_mode = "trajectory_only" if llm_cfg is None else str(

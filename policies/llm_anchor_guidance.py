@@ -45,18 +45,21 @@ def register_llm_anchor_guidance():
             self.robust_delta = float(robust_delta)
             self.anchor_positions = None
             self.anchor_mask = None
+            self.anchor_weights = None
             self.num_samples = None
 
-        def set_anchor_targets(self, positions, mask, num_samples):
+        def set_anchor_targets(self, positions, mask, num_samples, weights=None):
             """设置本次采样使用的局部坐标锚点及有效时间掩码。"""
             self.anchor_positions = positions
             self.anchor_mask = mask
+            self.anchor_weights = weights
             self.num_samples = int(num_samples)
 
         def clear_anchor_targets(self):
             """清除逐帧目标，避免跨场景或跨计划复用旧锚点。"""
             self.anchor_positions = None
             self.anchor_mask = None
+            self.anchor_weights = None
             self.num_samples = None
 
         def update_params(self, params: Dict[str, torch.Tensor]) -> None:
@@ -96,6 +99,14 @@ def register_llm_anchor_guidance():
                 distance - 0.5 * delta,
             )
             robust_loss = robust_loss * anchor_mask[:, :horizon].to(robust_loss.dtype)
+            if self.anchor_weights is not None:
+                anchor_weights = enlarge_batch_samples(
+                    self.anchor_weights.to(device=state.device, dtype=state.dtype),
+                    batch_size,
+                    self.num_samples,
+                )
+                # AnchorDrive 风格的阶段权重：交互和收束阶段可比早期接近阶段更受重视。
+                robust_loss = robust_loss * anchor_weights[:, :horizon]
             if self.loss_timesteps is not None:
                 valid_horizon = min(horizon, int(self.loss_timesteps))
                 timestep_mask = torch.arange(horizon, device=state.device) < valid_horizon

@@ -244,37 +244,78 @@ class CandidateBuilder:
         self.ttc_range = tuple(getattr(settings,'ttc_range_s',(1.,5.)))
         # 默认无低速模板；实验显式启用时仍须经过完整道路、背景和规避筛查。
         self.low_speed_decelerations = tuple(float(x) for x in getattr(settings,'low_speed_decelerations_mps2',()))
+        # 目录扩展必须显式开启，默认保持既有前向候选协议，避免改变历史实验。
+        self.candidate_expansion_enabled = bool(getattr(settings,'candidate_expansion_enabled',False))
+        self.expanded_longitudinal_range = tuple(float(x) for x in getattr(settings,'candidate_expansion_longitudinal_range_m',(2.,60.)))
+        self.expanded_lateral_limit = float(getattr(settings,'candidate_expansion_lateral_limit_m',10.))
+        self.expanded_heading_limit = float(getattr(settings,'candidate_expansion_heading_limit_rad',1.2))
+        # 后向逼近模板只在显式给出加速度列表时启用；连续控制仍由 diffusion 生成。
+        self.rear_approach_accelerations = tuple(float(x) for x in getattr(settings,'rear_approach_accelerations_mps2',()))
+        self.last_audit = {}
         if self.margin < 0 or self.half_width <= 0 or len(self.ttc_range)!=2 or not 0 < self.ttc_range[0] < self.ttc_range[1]:
             raise ValueError("画像候选安全边界或 TTC 区间无效")
         if any(not np.isfinite(x) or not 0 < x <= 2 for x in self.low_speed_decelerations):
             raise ValueError('低速候选减速度必须在 (0, 2] m/s²')
+        if (len(self.expanded_longitudinal_range)!=2 or not 0 <= self.expanded_longitudinal_range[0] < self.expanded_longitudinal_range[1] <= 80
+                or not 0 < self.expanded_lateral_limit <= 15 or not 0 < self.expanded_heading_limit <= np.pi):
+            raise ValueError('候选目录扩展边界无效')
+        if any(not np.isfinite(x) or not 0 < x <= 4 for x in self.rear_approach_accelerations):
+            raise ValueError('后向逼近候选加速度必须在 (0, 4] m/s²')
 
     def build(self, env, profile, knowledge):
         ego = np.asarray(env.ego_state,float)
         states = np.asarray(env.data_dict['agent'][-1],float)
         active = np.flatnonzero(env.agent_active)
         if len(ego)<7 or states.shape[1]<7:
+            self.last_audit = {'status':'missing_vehicle_geometry','active_agents':int(len(active))}
             return [], {'missing_vehicle_geometry':1}
         if not np.isfinite(ego[:7]).all() or not np.isfinite(states[active,:7]).all() or np.any(states[active,5:7]<=0) or np.any(ego[5:7]<=0):
+            self.last_audit = {'status':'invalid_vehicle_geometry','active_agents':int(len(active))}
             return [], {'invalid_vehicle_geometry':1}
         lanes = [np.asarray(line)[:,:2] for line in env.scenario_dict.get('lanes',[]) if np.asarray(line).ndim==2 and len(line)>1 and np.isfinite(line).all() and np.any(np.linalg.norm(np.diff(np.asarray(line)[:,:2],axis=0),axis=1)>1e-3)]
         if not lanes:
+            self.last_audit = {'status':'missing_road_geometry','active_agents':int(len(active))}
             return [], {'missing_road_geometry':1}
         condition = scene_conditions(env)
         forward = np.array([math.cos(ego[4]),math.sin(ego[4])])
         lateral = np.array([-forward[1],forward[0]])
         proposals, rejected = [], {}
+        audit = dict(status='ok',active_agents=int(len(active)),forward_eligible_agents=0,
+                     rear_eligible_agents=0,template_count=0,screened_count=0,
+                     ineligible=dict(longitudinal=0,lateral=0,heading=0),
+                     expansion_enabled=self.candidate_expansion_enabled,
+                     rear_template_enabled=bool(self.rear_approach_accelerations))
+        forward_min,forward_max = (self.expanded_longitudinal_range if self.candidate_expansion_enabled else (5.,45.))
+        lateral_limit = self.expanded_lateral_limit if self.candidate_expansion_enabled else 7.
+        heading_limit = self.expanded_heading_limit if self.candidate_expansion_enabled else .7
         # 一秒间隔四锚点描述意图，连续轨迹仍由 diffusion 生成。
         t = np.arange(4,dtype=float)
         for target in active:
             state = states[target]
             relative = state[:2]-ego[:2]
             longitudinal,side = relative@forward, relative@lateral
-            if not 5 < longitudinal < 45 or abs(side)>7 or abs(math.atan2(math.sin(state[4]-ego[4]),math.cos(state[4]-ego[4])))>.7:
+            heading_delta = abs(math.atan2(math.sin(state[4]-ego[4]),math.cos(state[4]-ego[4])))
+            forward_eligible = forward_min < longitudinal < forward_max and abs(side) <= lateral_limit and heading_delta <= heading_limit
+            rear_eligible = bool(self.rear_approach_accelerations) and -35. < longitudinal < -2. and abs(side) <= 1.5 and heading_delta <= heading_limit
+            if not forward_eligible and not rear_eligible:
+                # 一辆车只记录首个不满足的资格条件，保证目录审计能解释空目录而不重复计数。
+                if not (forward_min < longitudinal < forward_max):
+                    audit['ineligible']['longitudinal'] += 1
+                elif abs(side) > lateral_limit:
+                    audit['ineligible']['lateral'] += 1
+                else:
+                    audit['ineligible']['heading'] += 1
                 continue
+            audit['forward_eligible_agents'] += int(forward_eligible)
+            audit['rear_eligible_agents'] += int(rear_eligible)
             speed = np.linalg.norm(state[2:4])
             proposals_for_target = []
-            if abs(side)<1.5:
+            if rear_eligible:
+                direction = state[2:4]/speed if speed > .1 else forward
+                for acceleration in self.rear_approach_accelerations:
+                    anchors = state[:2]+t[:,None]*state[2:4]+.5*acceleration*(t*t)[:,None]*direction
+                    proposals_for_target.append(('sudden_acceleration','rear_pressure',anchors))
+            elif abs(side)<1.5:
                 decelerations = (1.,2.) + (self.low_speed_decelerations if speed < 3. else ())
                 for decel in dict.fromkeys(decelerations):
                     distance = speed*t-.5*decel*t*t
@@ -289,7 +330,9 @@ class CandidateBuilder:
                 if heading_delta>.12:
                     proposals_for_target.append(('lane_change','merge_conflict',anchors))
             for strategy,family,anchors in proposals_for_target:
+                audit['template_count'] += 1
                 estimates,reason = self.screen(env,int(target),anchors,lanes)
+                audit['screened_count'] += 1
                 if reason:
                     rejected[reason] = rejected.get(reason,0)+1
                     continue
@@ -298,7 +341,7 @@ class CandidateBuilder:
                 yaw = stats.get('yaw_rate_rps',{})
                 brake = stats.get('acceleration_mps2',{})
                 # 有证据才使用行为匹配；冷启动给中性值并明示不确定性。
-                metric = brake if family=='forward_pressure' else yaw
+                metric = brake if family in ('forward_pressure','rear_pressure') else yaw
                 match = .5
                 if metric.get('n',0)>=20:
                     match = float(np.clip(.5+(.15*float(metric['ewma']) if family=='forward_pressure' else -.5*abs(float(metric['ewma']))),0,1))
@@ -306,6 +349,9 @@ class CandidateBuilder:
                                       attack_family=family,anchors=anchors.tolist(),duration=10,
                                       scene_conditions=condition,profile_match=match,profile_evidence_frames=metric.get('n',0),
                                       vulnerability=prior,**estimates))
+        audit['candidate_count'] = int(len(proposals))
+        audit['screen_rejections'] = dict(rejected)
+        self.last_audit = audit
         return proposals,rejected
 
     def screen(self, env, target, anchors, lanes):
@@ -339,13 +385,18 @@ class CandidateBuilder:
         contact = np.flatnonzero(gap<=0)
         closing = max(0.,float(np.linalg.norm(ego[2:4])-np.linalg.norm(velocities[-1])))
         ttc = float(times[contact[0]]) if len(contact) else (float(gap[-1]/closing+3) if closing>1e-3 else None)
-        if ttc is None or not self.ttc_range[0]<=ttc<=self.ttc_range[1]:
-            return None,'outside_ttc_band'
-        return dict(estimated_risk=float(np.clip(1-ttc/(self.ttc_range[1]+1),0,1)),
+        # 暂时停用 TTC 区间拒绝门控，避免交互候选在进入 diffusion 前被过量过滤。
+        # 后续实验若需恢复，只取消下面两行注释；TTC 仍完整记录用于分析和排序。
+        # if ttc is None or not self.ttc_range[0] <= ttc <= self.ttc_range[1]:
+        #     return None, 'outside_ttc_band'
+        estimated_risk = (float(np.clip(1-ttc/(self.ttc_range[1]+1),0,1))
+                          if ttc is not None else None)
+        return dict(estimated_risk=estimated_risk,
                     estimated_ttc_s=ttc,avoidability=dict(witness=None,
                         requirement='theoretical_drivable_area_must_remain_positive'),
                     background_safety_margin_m=finite(clearance),
-                    screening_model='constant_velocity_others; 0.05s samples; background OBB margin; attacker road topology exempt; not continuous safety guarantee'),None
+                    ttc_band_gate_enabled=False,
+                    screening_model='constant_velocity_others; 0.05s samples; background OBB margin; attacker road topology exempt; TTC band recorded but not gated; not continuous safety guarantee'),None
 
 
 def policy_id_for_sim(sim_cfg):
@@ -355,78 +406,21 @@ def policy_id_for_sim(sim_cfg):
     return hashlib.sha256(identity.encode()).hexdigest()[:20]
 
 
-class ProfileAttackPipeline:
+class JointTrajectorySafetyGate:
+    """画像开关两侧共用的联合轨迹动力学与背景安全门控。"""
     def __init__(self, sim_cfg):
         from types import SimpleNamespace
         settings = getattr(sim_cfg,'ego_profile',SimpleNamespace())
-        self.policy_id = policy_id_for_sim(sim_cfg)
-        self.profile = EgoProfile(settings)
-        self.knowledge = AttackKnowledge(self.policy_id,getattr(settings,'history_paths',[]))
-        self.builder = CandidateBuilder(settings)
         collision_cfg = getattr(getattr(getattr(getattr(sim_cfg,'traffic_model',None),'guidance',None),'loss_configs',None),'scenario_collision',None)
         self.dynamic_limits = {name:float(getattr(collision_cfg,name,default)) for name,default in
                                (('max_speed',20.),('max_acceleration',6.),('max_jerk',20.),('max_step_distance',2.))}
         if any(not np.isfinite(v) or v<=0 for v in self.dynamic_limits.values()):
             raise ValueError('画像硬门槛需要有效且为正的动力学边界')
-        self.pending = None
-        self.attempt_id = None
-        self.attempt_dir = None
-
-    def begin_attempt(self, env, directory):
-        self.profile.reset_episode()
-        self.attempt_id = uuid.uuid4().hex
-        self.attempt_dir = Path(directory)
-        self.knowledge.path = self.attempt_dir/'strategy_returns.jsonl'
-        self.profile.observe(env)
-
-    def context(self, env, u):
-        condition = scene_conditions(env)
-        profile = self.profile.snapshot(condition)
-        candidates,rejected = self.builder.build(env,profile,self.knowledge)
-        self.pending = dict(attempt_id=self.attempt_id,scene_id=str(getattr(env,'current_scene_id','unknown')),request_id=uuid.uuid4().hex,profile_version=profile['version'],
-                            scene_conditions=condition, strategy=None,target=None,u=float(u),
-                            actual_attack_execution_frames=0,D=None,drivable_area_change_ratio=None,
-                            area_basis='reachable_area_not_map_drivable_area',generation_failure_reason=None,
-                            accepted=False,collision=False,background_safe=True,reward=None,reaction_time_s=None,
-                            reaction_censored=True,first_execution_step=None,candidate_rejections=rejected)
-        self.pending['pre_attack_acceleration_mps2'] = (self.profile.previous or {}).get('accel')
-        return dict(profile=profile,candidates=candidates,candidate_rejections=rejected,
-                    history=self.knowledge.retrieve(condition),objective='low response margin; retain positive theoretical drivable area; collision is not the reward objective')
-
-    def planned(self, plan, service_failure=False):
-        if not self.pending:
-            return
-        self.pending['obstacle_plan'] = plan.get('obstacle_plan',[]) if plan else []
-        self.pending['obstacle_created_ids'] = []
-        self.pending['actual_obstacle_exposure_frames'] = 0
-        if plan and plan.get('attack'):
-            self.pending.update(request_id=plan.get('request_id') or self.pending['request_id'],
-                                strategy=plan.get('attack_family',plan['strategy']),target=plan['attack_target_id'],
-                                candidate_id=plan.get('candidate_id'))
-        elif plan and plan.get('obstacle_plan'):
-            self.pending.update(strategy='obstacle_only',request_id=plan.get('request_id') or self.pending['request_id'])
-        else:
-            self.pending['generation_failure_reason'] = 'planner_service_failure' if service_failure else (plan.get('reason','no_attack') if plan else 'plan_validation_failed')
-
-    def executed(self, env, audit, info, trace):
-        executed = bool(audit and audit.get('executed'))
-        self.profile.observe(env,executed)
-        row = self.pending
-        if not row:
-            return
-        row['collision'] |= bool(info.get('collision'))
-        row['background_safe'] &= not bool(trace.previous_background or trace.previous_static)
-        if set(row.get('obstacle_created_ids',[])) & {str(o['id']) for o in env.get_static_obstacles()}:
-            row['actual_obstacle_exposure_frames'] += 1
-        if executed and audit.get('target_id')==row['target'] and audit.get('request_id')==row['request_id']:
-            row['actual_attack_execution_frames'] += 1
-            if row['first_execution_step'] is None:
-                row['first_execution_step'] = int(env.current_step)
-            previous = self.profile.previous or {}
-            baseline = row.get('pre_attack_acceleration_mps2')
-            if row['reaction_censored'] and baseline is not None and abs((previous.get('accel') or 0)-baseline)>1.:
-                row['reaction_time_s'] = (int(env.current_step)-row['first_execution_step'])*float(env.dt)
-                row['reaction_censored'] = False
+        # 保留与拒绝可视化审计兼容的最小几何配置。
+        self.builder = SimpleNamespace(
+            margin=float(getattr(settings,'background_margin_m',.5)),
+            half_width=float(getattr(settings,'lane_half_width_m',1.8)),
+        )
 
     def validate_joint(self, env):
         """对实际联合预测施加动力学和背景硬门槛；不使用道路距离拒绝。"""
@@ -468,6 +462,82 @@ class ProfileAttackPipeline:
                 raise NoSafeJointCandidate('profile_joint_background_margin')
             if any(np.min(obb_clearance(box,np.broadcast_to(obstacle_box(o),box.shape)))<self.builder.margin for o in env.get_static_obstacles()):
                 raise NoSafeJointCandidate('profile_joint_static_margin')
+
+
+class ProfileAttackPipeline:
+    def __init__(self, sim_cfg):
+        from types import SimpleNamespace
+        settings = getattr(sim_cfg,'ego_profile',SimpleNamespace())
+        self.policy_id = policy_id_for_sim(sim_cfg)
+        self.profile = EgoProfile(settings)
+        self.knowledge = AttackKnowledge(self.policy_id,getattr(settings,'history_paths',[]))
+        self.builder = CandidateBuilder(settings)
+        self.joint_gate = JointTrajectorySafetyGate(sim_cfg)
+        self.dynamic_limits = self.joint_gate.dynamic_limits
+        self.pending = None
+        self.attempt_id = None
+        self.attempt_dir = None
+
+    def begin_attempt(self, env, directory):
+        self.profile.reset_episode()
+        self.attempt_id = uuid.uuid4().hex
+        self.attempt_dir = Path(directory)
+        self.knowledge.path = self.attempt_dir/'strategy_returns.jsonl'
+        self.profile.observe(env)
+
+    def context(self, env, u):
+        condition = scene_conditions(env)
+        profile = self.profile.snapshot(condition)
+        candidates,rejected = self.builder.build(env,profile,self.knowledge)
+        self.pending = dict(attempt_id=self.attempt_id,scene_id=str(getattr(env,'current_scene_id','unknown')),request_id=uuid.uuid4().hex,profile_version=profile['version'],
+                            scene_conditions=condition, strategy=None,target=None,u=float(u),
+                            actual_attack_execution_frames=0,D=None,drivable_area_change_ratio=None,
+                            area_basis='reachable_area_not_map_drivable_area',generation_failure_reason=None,
+                            accepted=False,collision=False,background_safe=True,reward=None,reaction_time_s=None,
+                            reaction_censored=True,first_execution_step=None,candidate_rejections=rejected,
+                            candidate_audit=dict(self.builder.last_audit))
+        self.pending['pre_attack_acceleration_mps2'] = (self.profile.previous or {}).get('accel')
+        return dict(profile=profile,candidates=candidates,candidate_rejections=rejected,
+                    candidate_audit=dict(self.builder.last_audit),
+                    history=self.knowledge.retrieve(condition),objective='low response margin; retain positive theoretical drivable area; collision is not the reward objective')
+
+    def planned(self, plan, service_failure=False):
+        if not self.pending:
+            return
+        self.pending['obstacle_plan'] = plan.get('obstacle_plan',[]) if plan else []
+        self.pending['obstacle_created_ids'] = []
+        self.pending['actual_obstacle_exposure_frames'] = 0
+        if plan and plan.get('attack'):
+            self.pending.update(request_id=plan.get('request_id') or self.pending['request_id'],
+                                strategy=plan.get('attack_family',plan['strategy']),target=plan['attack_target_id'],
+                                candidate_id=plan.get('candidate_id'))
+        elif plan and plan.get('obstacle_plan'):
+            self.pending.update(strategy='obstacle_only',request_id=plan.get('request_id') or self.pending['request_id'])
+        else:
+            self.pending['generation_failure_reason'] = 'planner_service_failure' if service_failure else (plan.get('reason','no_attack') if plan else 'plan_validation_failed')
+
+    def executed(self, env, audit, info, trace):
+        executed = bool(audit and audit.get('executed'))
+        self.profile.observe(env,executed)
+        row = self.pending
+        if not row:
+            return
+        row['collision'] |= bool(info.get('collision'))
+        row['background_safe'] &= not bool(trace.previous_background or trace.previous_static)
+        if set(row.get('obstacle_created_ids',[])) & {str(o['id']) for o in env.get_static_obstacles()}:
+            row['actual_obstacle_exposure_frames'] += 1
+        if executed and audit.get('target_id')==row['target'] and audit.get('request_id')==row['request_id']:
+            row['actual_attack_execution_frames'] += 1
+            if row['first_execution_step'] is None:
+                row['first_execution_step'] = int(env.current_step)
+            previous = self.profile.previous or {}
+            baseline = row.get('pre_attack_acceleration_mps2')
+            if row['reaction_censored'] and baseline is not None and abs((previous.get('accel') or 0)-baseline)>1.:
+                row['reaction_time_s'] = (int(env.current_step)-row['first_execution_step'])*float(env.dt)
+                row['reaction_censored'] = False
+
+    def validate_joint(self, env):
+        return self.joint_gate.validate_joint(env)
 
     def finish_window(self, window=None, events=(), failure=None):
         row = self.pending

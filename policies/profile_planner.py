@@ -45,18 +45,40 @@ def rank_profile_candidates(planner, env_state, instruction, context, scene_imag
                       'The supplied candidates already passed interaction and non-target background safety screening. '
                       'A missing attack history means the benefit estimate is uncertain. No explicit ego avoidance witness is required. '
                       'If at least one candidate is listed, choose and rank them unless you can identify a concrete contradiction in the supplied geometry. '
-                      'Return JSON only with request_id, ranking, no_attack_reason'+(', obstacle_candidate_id. ' if joint_mode else '. ')+'ranking is a permutation of every candidate_id, best first; '
+                      'Return JSON only with request_id, ranking, no_attack_reason'+(', obstacle_candidate_id. ' if joint_mode else '. ')+'ranking lists one or more candidate_id values, best first; '
                       'or [] with a nonempty no_attack_reason if none should be attempted. Repeat request_id exactly. '
                       'Use the scene-conditioned profile, uncertainty, historical failures and measured returns. Choose a supplied feasible probe in cold start; history is not required for a positive theoretical drivable-area check. Do not invent trajectories, controls or candidates.'+extra+'\n'
                       +json.dumps(payload,ensure_ascii=False,allow_nan=False))
             _,response = planner._request_attack_plan(prompt,scene_image=scene_image)
             transport_complete = True
+            # 只记录排序协议相关摘要，便于审计拒绝原因；不保存提示词或服务凭据。
+            if isinstance(response,dict):
+                ranking_summary = response.get('ranking')
+                if isinstance(ranking_summary,list):
+                    ranking_summary = ranking_summary[:50]
+                reason_summary = response.get('no_attack_reason')
+                if isinstance(reason_summary,str):
+                    reason_summary = reason_summary[:500]
+                planner.last_trace['response_summary'] = {
+                    'keys': sorted(map(str,response.keys())),
+                    'request_id': response.get('request_id'),
+                    'ranking': ranking_summary,
+                    'no_attack_reason': reason_summary,
+                    'obstacle_candidate_id': response.get('obstacle_candidate_id'),
+                }
+            else:
+                planner.last_trace['response_summary'] = {'response_type':type(response).__name__}
             fields={'request_id','ranking','no_attack_reason'} | ({'obstacle_candidate_id'} if joint_mode else set())
             if not isinstance(response,dict) or set(response)!=fields or response['request_id']!=request_id:
                 raise ValueError('ranking_schema_or_request_id')
             ranking = response['ranking']
             reason = response['no_attack_reason']
-            if not isinstance(ranking,list) or any(not isinstance(x,str) for x in ranking) or not isinstance(reason,str):
+            if not isinstance(ranking,list) or any(not isinstance(x,str) for x in ranking):
+                raise ValueError('ranking_type')
+            # 有有效排序时，JSON null 与空字符串都表示“不是无攻击”；空排序仍要求文字理由。
+            if ranking and reason is None:
+                reason = ''
+            if not isinstance(reason,str):
                 raise ValueError('ranking_type')
             obstacles=[]
             if joint_mode:
@@ -67,8 +89,15 @@ def rank_profile_candidates(planner, env_state, instruction, context, scene_imag
                     raise ValueError('missing_no_attack_reason')
                 planner.last_trace['plan_validation'] = 'no_attack'
                 return dict(attack=False,attack_target_id=-1,strategy='none',anchors=[],reason=reason,request_id=request_id,obstacle_plan=obstacles)
-            if len(ranking)!=len(catalog) or set(ranking)!=set(catalog) or reason:
-                raise ValueError('ranking_not_catalog_permutation')
+            if len(ranking)!=len(set(ranking)) or not set(ranking).issubset(catalog) or reason:
+                raise ValueError('ranking_not_catalog_subset')
+            if len(ranking)!=len(catalog):
+                if not bool(getattr(planner,'profile_allow_partial_ranking',False)):
+                    raise ValueError('ranking_not_catalog_permutation')
+                # 大模型可以只给出最有把握的前缀；未列出的安全候选保持规则层原顺序，
+                # 既不允许模型发明候选，也不因省略完整排列而丢失一次有效攻击机会。
+                ranking = ranking + [candidate_id for candidate_id in catalog if candidate_id not in ranking]
+                planner.last_trace['partial_ranking_completed'] = True
             selected = catalog[ranking[0]]
         plan = dict(attack=True,attack_target_id=selected['target_id'],strategy=selected['strategy'],
                     attack_family=selected['attack_family'],anchors=selected['anchors'],duration=selected['duration'],
@@ -86,8 +115,29 @@ def rank_profile_candidates(planner, env_state, instruction, context, scene_imag
         return plan
     except Exception as error:
         # 传输/服务失败与返回后的语义拒绝区分；均不得进入自由规划回退路径。
-        planner.last_request_failed = not transport_complete
-        planner.last_trace.update(plan_validation='planner_service_failure' if planner.last_request_failed else 'plan_validation_failed',error_type=type(error).__name__,request_id=request_id)
+        # JSON/契约错误可能在请求函数内部、transport_complete 置位前抛出；
+        # 以异常类型判定服务状态，避免把 HTTP 200 的无效输出误计为服务故障。
+        checker = getattr(planner,'_is_service_failure',None)
+        if checker is None:
+            # 测试替身和外部轻量规划器可能只实现传输接口；统一复用生产判定，
+            # 避免本地语义拒绝被 AttributeError 覆盖而丢失真实原因。
+            from policies.llm_adversarial_planner import LLMAdversarialPlanner
+            checker = LLMAdversarialPlanner._is_service_failure
+        planner.last_request_failed = checker(error)
+        failure = 'planner_service_failure' if planner.last_request_failed else 'plan_validation_failed'
+        planner.last_trace.update(
+            plan_validation=failure,
+            error_type=type(error).__name__,
+            request_id=request_id,
+            attempted_models=list(getattr(planner,'last_attempted_model_names',[])),
+            successful_model=getattr(planner,'last_successful_model_name',None),
+            model_failures=list(getattr(planner,'last_model_failures',[])),
+        )
+        if not planner.last_request_failed:
+            # 这里的异常均来自本地封闭协议与语义验证器，可安全记录精确规则。
+            planner.last_trace['validation_reason'] = (str(error) or type(error).__name__)[:500]
+        else:
+            planner.last_trace['service_status_code'] = getattr(error,'status_code',None)
         return None
     finally:
         planner.last_trace['elapsed_seconds'] = time.monotonic()-started

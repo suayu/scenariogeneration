@@ -219,7 +219,7 @@ def main():
     parser.add_argument("--methods", default="ours,safe_sim,scenario_dreamer")
     parser.add_argument("--scenario-indices", default="")
     parser.add_argument("--scenarios", type=int, default=2)
-    parser.add_argument("--steps", type=int, default=45)
+    parser.add_argument("--steps", type=int, default=400)
     parser.add_argument("--output-dir", required=True)
     args = parser.parse_args()
     methods = [item.strip() for item in args.methods.split(",") if item.strip()]

@@ -74,6 +74,9 @@ class DiffusionModelWrapper:
         anchor_max_update=0.5,
         anchor_guide_steps=1,
         anchor_scale_grad_by_std=True,
+        anchor_drive_enabled=False,
+        anchor_phase_weights=(0.75, 1.25, 1.75),
+        anchor_candidate_score_weight=0.25,
         capture_candidate_trajectories=False,
     ):
         self.safe_sim_root = Path(safe_sim_root).expanduser().resolve()
@@ -117,6 +120,9 @@ class DiffusionModelWrapper:
         self.anchor_max_update = float(anchor_max_update)
         self.anchor_guide_steps = int(anchor_guide_steps)
         self.anchor_scale_grad_by_std = bool(anchor_scale_grad_by_std)
+        self.anchor_drive_enabled = bool(anchor_drive_enabled)
+        self.anchor_phase_weights = tuple(float(value) for value in anchor_phase_weights)
+        self.anchor_candidate_score_weight = float(anchor_candidate_score_weight)
         if self.anchor_guidance_strength < 0:
             raise ValueError("anchor_guidance_strength must be non-negative")
         if self.anchor_interval_seconds <= 0:
@@ -129,6 +135,11 @@ class DiffusionModelWrapper:
             raise ValueError("anchor_max_update must be positive")
         if self.anchor_guide_steps < 1:
             raise ValueError("anchor_guide_steps must be at least one")
+        if len(self.anchor_phase_weights) != 3 or any(value < 0 for value in self.anchor_phase_weights):
+            raise ValueError("anchor_phase_weights must contain three non-negative values")
+        if self.anchor_candidate_score_weight < 0:
+            raise ValueError("anchor_candidate_score_weight must be non-negative")
+        self._last_anchor_audit = None
         self.scene_id = None
         self.active_guidance_functions = []
         self.guidance_enabled = False
@@ -512,6 +523,7 @@ class DiffusionModelWrapper:
                 tensors["llm_anchor_positions_local"],
                 tensors["llm_anchor_mask"],
                 self.num_samples,
+                weights=tensors.get("llm_anchor_weights"),
             )
         else:
             anchor_loss.clear_anchor_targets()
@@ -585,9 +597,10 @@ class DiffusionModelWrapper:
             }
         }
 
-    def _select_joint_guided_action(self, policy_net, model_batch, action, info):
+    def _select_joint_guided_action(self, policy_net, model_batch, action, info, anchor_tensors=None):
         """使用全场联合损失为所有交通参与者选择同一个扩散样本。"""
         samples = info.get("action_samples")
+        self._last_anchor_audit = None
         if not self.guidance_enabled or not isinstance(samples, dict):
             return action, None
         positions = samples.get("positions")
@@ -637,6 +650,16 @@ class DiffusionModelWrapper:
                 guidance_data["ego_extents"].detach().cpu().numpy(),
             )
             joint_scores[~torch.as_tensor(safe,device=joint_scores.device)] = torch.inf
+            if getattr(self, "anchor_drive_enabled", False) and anchor_tensors is not None:
+                targets = anchor_tensors["llm_anchor_positions_local"].to(positions.device)
+                mask = anchor_tensors["llm_anchor_mask"].to(positions.device)
+                weights = anchor_tensors["llm_anchor_weights"].to(positions.device)
+                distance = torch.linalg.norm(positions[..., :2] - targets[:, None], dim=-1)
+                weighted_mask = mask[:, None].to(distance.dtype) * weights[:, None]
+                denominator = weighted_mask.sum(dim=(0, 2)).clamp_min(1e-6)
+                anchor_scores = (distance * weighted_mask).sum(dim=(0, 2)) / denominator
+                # 硬安全门槛通过后，再按锚点完成度重排，避免语义收益覆盖安全拒绝。
+                joint_scores = joint_scores + self.anchor_candidate_score_weight * anchor_scores
             if not bool(torch.isfinite(joint_scores).any()):
                 # 仅失败时冻结非敏感几何数据，便于离线复核坐标与碰撞根因。
                 diagnostic_dir = os.environ.get("RISKWEAVER_DIAGNOSTIC_DIR")
@@ -649,6 +672,13 @@ class DiffusionModelWrapper:
                         scores=raw_scores, safe=safe)
                 raise NoSafeJointCandidate(f"联合候选拒绝：几何安全={int(safe[1:].sum())}/{num_samples-1}，有限评分={int(np.isfinite(raw_scores[1:]).sum())}/{num_samples-1}")
             selected_index = int(torch.argmin(joint_scores).item())
+            if getattr(self, "anchor_drive_enabled", False) and anchor_tensors is not None:
+                selected_distance = distance[:, selected_index][mask]
+                self._last_anchor_audit = {
+                    "mean_error_m": float(selected_distance.mean().item()),
+                    "max_error_m": float(selected_distance.max().item()),
+                    "candidate_score": float(anchor_scores[selected_index].item()),
+                }
 
         selected_action = type(action)(
             positions=positions[:, selected_index],
@@ -693,6 +723,9 @@ class DiffusionModelWrapper:
                 attack_intent=attack_intent,
                 prediction_horizon=self.prediction_horizon,
                 anchor_interval_seconds=self.anchor_interval_seconds,
+                anchor_phase_weights=(
+                    self.anchor_phase_weights if self.anchor_drive_enabled else (1.0, 1.0, 1.0)
+                ),
             )
 
         model_batch = dict(safe_batch.data)
@@ -767,6 +800,7 @@ class DiffusionModelWrapper:
             model_batch,
             action,
             info,
+            anchor_tensors if self.uses_anchor_guidance and anchor_metadata["active"] else None,
         )
         if perf is not None:
             perf["joint_selection_s"] = self._perf_stop(selection_start)
@@ -850,6 +884,10 @@ class DiffusionModelWrapper:
                 "anchor_guidance_target_id": anchor_metadata["target_id"],
                 "anchor_guidance_valid_steps": anchor_metadata["valid_steps"],
                 "anchor_guidance_strength": self.anchor_guidance_strength,
+                "anchor_drive_enabled": self.anchor_drive_enabled,
+                "anchor_time_source": anchor_metadata.get("time_source"),
+                "anchor_phase_weights": anchor_metadata.get("phase_weights"),
+                "anchor_satisfaction": self._last_anchor_audit,
                 "mixed_precision": self.mixed_precision,
                 "multi_gpu_devices": [str(device) for device, _ in self.policy_replicas],
                 "far_agent_mode": self.far_agent_mode,

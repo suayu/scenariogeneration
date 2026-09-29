@@ -350,11 +350,13 @@ class SafeSimBatchAdapter:
         attack_intent,
         prediction_horizon,
         anchor_interval_seconds,
+        anchor_phase_weights=None,
     ):
         """将全局 LLM 锚点插值为攻击车局部坐标系下的逐帧引导目标。"""
         batch_size = len(safe_batch.row_to_agent_id)
         positions_local = np.zeros((batch_size, prediction_horizon, 2), dtype=np.float32)
         valid_mask = np.zeros((batch_size, prediction_horizon), dtype=bool)
+        timestep_weights = np.zeros((batch_size, prediction_horizon), dtype=np.float32)
         metadata = {
             "active": False,
             "target_id": None,
@@ -363,6 +365,7 @@ class SafeSimBatchAdapter:
         tensors = {
             "llm_anchor_positions_local": torch.from_numpy(positions_local),
             "llm_anchor_mask": torch.from_numpy(valid_mask),
+            "llm_anchor_weights": torch.from_numpy(timestep_weights),
         }
         if attack_intent is None:
             return tensors, metadata
@@ -387,7 +390,17 @@ class SafeSimBatchAdapter:
         prediction_times = elapsed_seconds + (
             np.arange(prediction_horizon, dtype=np.float32) + 1.0
         ) * frame.dt
-        anchor_times = np.arange(len(anchors_global), dtype=np.float32) * anchor_interval_seconds
+        supplied_times = attack_intent.get("anchor_times_s")
+        if supplied_times is None:
+            anchor_times = np.arange(len(anchors_global), dtype=np.float32) * anchor_interval_seconds
+            time_source = "fixed_interval"
+        else:
+            anchor_times = np.asarray(supplied_times, dtype=np.float32)
+            if anchor_times.shape != (len(anchors_global),):
+                raise ValueError("anchor_times_s must have one timestamp per anchor")
+            if not np.isfinite(anchor_times).all() or anchor_times[0] < 0 or np.any(np.diff(anchor_times) <= 0):
+                raise ValueError("anchor_times_s must be finite, non-negative and strictly increasing")
+            time_source = "explicit"
         active_steps = prediction_times <= anchor_times[-1] + 1e-6
         if not active_steps.any():
             return tensors, metadata
@@ -404,12 +417,23 @@ class SafeSimBatchAdapter:
             safe_batch.agent_from_world[target_row],
         )
         valid_mask[target_row, active_steps] = True
+        phase_weights = np.asarray(
+            [1.0, 1.0, 1.0] if anchor_phase_weights is None else anchor_phase_weights,
+            dtype=np.float32,
+        )
+        if phase_weights.shape != (3,) or not np.isfinite(phase_weights).all() or np.any(phase_weights < 0):
+            raise ValueError("anchor_phase_weights must contain three finite non-negative values")
+        progress = prediction_times[active_steps] / max(float(anchor_times[-1]), frame.dt)
+        phase_index = np.minimum((progress * 3.0).astype(np.int64), 2)
+        timestep_weights[target_row, active_steps] = phase_weights[phase_index]
         metadata.update(
             {
                 "active": True,
                 "target_id": target_id,
                 "valid_steps": int(active_steps.sum()),
                 "elapsed_seconds": float(elapsed_seconds),
+                "time_source": time_source,
+                "phase_weights": phase_weights.tolist(),
             }
         )
         return tensors, metadata

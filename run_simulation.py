@@ -22,6 +22,20 @@ from policies.joint_safety import NoSafeJointCandidate
 from policies.route_progress import normalized_route_progress
 from policies.evaluation_trace import AttemptTrace
 from policies.planner_smoke_gate import validate_planner_smoke
+from policies.realism_audit import TrajectoryRealismAudit
+
+
+def merge_episode_info(previous, step_info):
+    """合并单步信息并保证回合汇总所需的终局字段始终存在。"""
+    merged = {
+        "collision": False,
+        "off_route": False,
+        "completed": False,
+        "progress": 0.0,
+    }
+    merged.update(previous or {})
+    merged.update(step_info or {})
+    return merged
 
 
 def enable_llm_joint_guidance_for_natural_language(cfg, user_instruction):
@@ -60,6 +74,9 @@ class PolicyEvaluator:
             env.cfg,
             user_instruction,
             llm_planner=env.llm_planner,
+        )
+        self.realism_audit = TrajectoryRealismAudit(
+            getattr(self.cfg, "realism_audit", None), self.env.dt
         )
         if bool(getattr(self.cfg.evaluation.difficulty_control, "smoke_acceptance", False)):
             g = self.generator
@@ -141,6 +158,10 @@ class PolicyEvaluator:
     def _run_scenario_attempt(self, scenario_index, replay_index, target_mode):
         """从场景起点执行一次完整闭环；重放不增加额外校准攻击窗口。"""
         obs = self.env.reset(scenario_index)
+        realism_audit = getattr(self, "realism_audit", None)
+        if realism_audit is not None:
+            realism_audit.begin_episode()
+            realism_audit.observe(self.env)
         self.generator.reset_episode_stats(advance_instruction=replay_index == 0)
         # 重置风险算法回合状态后再读取边界，避免旧长度截断新回合数据。
         metric_offsets = self._metric_offsets()
@@ -159,8 +180,11 @@ class PolicyEvaluator:
         # 最小配置及默认关闭场景没有 traffic_model 节点，此时不启用投影。
         projection_cfg = getattr(getattr(self.cfg, "traffic_model", None), "dynamics_projection", None)
         projection_enabled = bool(getattr(projection_cfg, "enabled", False))
-        if projection_enabled and profile_pipeline is None:
-            raise ValueError("轨迹投影需要画像硬门禁完成全时域安全复核")
+        projection_gate = None
+        if projection_enabled:
+            # 投影与全时域复核是画像开关两侧共用的公共组件，避免消融组混入动力学尖峰。
+            from policies.ego_profile import JointTrajectorySafetyGate
+            projection_gate = JointTrajectorySafetyGate(self.cfg)
         if profile_pipeline is not None:
             profile_pipeline.begin_attempt(self.env, scenario_movie_dir)
 
@@ -170,6 +194,8 @@ class PolicyEvaluator:
             planning_start = time.monotonic()
             self.generator.step(self.env, current_t)
             profile_attack_active = profile_pipeline is not None and (self.env.attack_intent is not None or bool(self.env.get_static_obstacles()))
+            adversarial_active = self.env.attack_intent is not None or bool(self.env.get_static_obstacles())
+            joint_safety_gate = profile_pipeline or projection_gate
             # 每次预测前应用当前强度，包含无攻击、LLM 失败与刚结算窗口的路径。
             if self.generator.difficulty_mode != 'off':
                 self.generator._apply_iterative_stage(self.env)
@@ -185,20 +211,20 @@ class PolicyEvaluator:
             try:
                 self.env.prepare_background_traffic()
                 raw_joint_for_audit = self.env.pending_joint_trajectory
-                if profile_attack_active:
+                if adversarial_active and joint_safety_gate is not None:
                     if projection_enabled:
                         from policies.trajectory_projection import project_joint
                         corrected = project_joint(self.env.pending_joint_trajectory,
                             np.asarray(self.env.data_dict["agent"][-1], float), self.env.dt,
-                            profile_pipeline.dynamic_limits, projection_cfg,
+                            joint_safety_gate.dynamic_limits, projection_cfg,
                             getattr(self.env, 'previously_attacked_agent_ids', ()))
                         self.env.inject_joint_trajectory(corrected)
                         trace.append(dict(kind="dynamics_projection", step=int(self.env.current_step),
                                           audit=corrected.metadata["dynamics_projection"]))
-                    profile_pipeline.validate_joint(self.env)
+                    joint_safety_gate.validate_joint(self.env)
             except NoSafeJointCandidate as error:
                 from policies.rejection_audit import rejection_record
-                trace.append(rejection_record(self.env, profile_pipeline, str(error), raw_joint_for_audit))
+                trace.append(rejection_record(self.env, joint_safety_gate, str(error), raw_joint_for_audit))
                 # 保留生成失败状态，禁止把拒绝不安全候选计为无碰撞成功。
                 info = dict(collision=False, off_route=False, progress=0.0, **{
                     k:v for k,v in info.items() if k not in {"collision","off_route","progress"}})
@@ -241,7 +267,11 @@ class PolicyEvaluator:
             action = self.policy.act(obs)
             # 执行前冻结联合预测；执行后核对真实坐标，不以意图存在代替执行。
             execution_joint = self.env.pending_joint_trajectory
-            obs, terminated, info = self.env.step(action, anchors, refined_traj)
+            obs, terminated, step_info = self.env.step(action, anchors, refined_traj)
+            # Simulator 在普通非终止帧返回空字典；保留回合默认字段，供随后门控退出时审计。
+            info = merge_episode_info(info, step_info)
+            if realism_audit is not None:
+                realism_audit.observe(self.env)
             execution_audit = trace.attack_execution(self.env, execution_joint)
             self.generator.evaluate_reaction(self.env, info)
             trace.state(self.env, info)
@@ -262,6 +292,9 @@ class PolicyEvaluator:
             raise ValueError("路线为空或退化，无法计算真实能力分进度")
         info["progress"] = progress
         result = self._build_episode_result(scenario_index, info, metric_offsets)
+        realism = realism_audit.finish_episode() if realism_audit is not None else None
+        if realism is not None:
+            result["realism_audit"] = realism
         result["generation_failure"] = info.get("generation_failure")
         result['feasibility'] = trace.summary()
         result['attack_executed_frames'] = trace.attack_executed_frames
@@ -364,6 +397,21 @@ class PolicyEvaluator:
             all_metrics["difficulty_audit"] = summarize_attempts(self.episode_results)
             all_metrics["danger_weighted_complete_success"] = float(np.mean([item["scenario_danger_score"] * float(item["complete_success"]) for item in self.episode_results]))
             all_metrics["danger_weighted_partial_progress"] = float(np.mean([item["scenario_danger_score"] * item["partial_credit"] for item in self.episode_results]))
+            realism_rows = [item.get("realism_audit") for item in self.episode_results]
+            valid_realism = [row for row in realism_rows if row and row.get("valid")]
+            if any(row is not None for row in realism_rows):
+                all_metrics["realism_valid_scenario_count"] = len(valid_realism)
+                all_metrics["realism_valid_scenario_rate"] = float(len(valid_realism) / len(realism_rows))
+                all_metrics["realism_deviation"] = (
+                    float(np.mean([row["realism_deviation"] for row in valid_realism]))
+                    if valid_realism else None
+                )
+                for name in ("velocity", "lon_accel", "lat_accel", "jerk"):
+                    values = [row["wasserstein"][name] for row in valid_realism
+                              if row["wasserstein"].get(name) is not None]
+                    all_metrics[f"realism_wasserstein_{name}"] = (
+                        float(np.mean(values)) if values else None
+                    )
             difficulty_errors = np.asarray([
                 item.get("difficulty_absolute_error", np.nan)
                 for item in self.episode_results

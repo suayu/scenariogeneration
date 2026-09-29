@@ -6,11 +6,13 @@ provider="${1:?用法：$0 <openai|deepseek|dashscope> <命令...>}"
 shift
 # 调用命令显式传入的模型名优先于持久配置，避免切换 provider 时继承旧模型名。
 requested_model_name="${LLM_MODEL_NAME:-}"
+requested_model_names="${LLM_MODEL_NAMES:-}"
 env_file="${SCENARIO_DREAMER_LLM_ENV:-$HOME/.config/scenario-dreamer/llm.env}"
 if [[ "$provider" != "codex" && -f "$env_file" ]]; then
   # shellcheck disable=SC1090
   source "$env_file"
 fi
+configured_model_names="${requested_model_names:-${LLM_MODEL_NAMES:-}}"
 
 case "$provider" in
   codex)
@@ -39,7 +41,7 @@ case "$provider" in
     ;;
   dashscope)
     : "${DASHSCOPE_API_KEY:?请先在 $env_file 设置 DASHSCOPE_API_KEY}"
-    export LLM_MODEL_NAME="${requested_model_name:-qwen3.5-plus}"
+    export LLM_MODEL_NAME="${requested_model_name:-qwen-plus}"
     ;;
   *)
     echo "不支持的提供方：$provider" >&2
@@ -48,6 +50,12 @@ case "$provider" in
 esac
 
 export LLM_PROVIDER="$provider"
-# 始终把最终模型同步为唯一候选池，防止持久配置遗留的其他服务模型被规划器优先尝试。
-export LLM_MODEL_NAMES="$LLM_MODEL_NAME"
+# 百炼未显式指定列表时使用规划器活动池；其他提供方固定单模型以避免跨平台轮换。
+if [[ -n "$configured_model_names" ]]; then
+  export LLM_MODEL_NAMES="$configured_model_names"
+elif [[ "$provider" == "dashscope" ]]; then
+  unset LLM_MODEL_NAMES
+else
+  export LLM_MODEL_NAMES="$LLM_MODEL_NAME"
+fi
 exec "$@"

@@ -2,10 +2,18 @@
 import json
 import os
 import base64
+import re
+from pathlib import Path
 import numpy as np
 from policies.codex_planner_bridge import CodexQueueClient, PlannerServiceFailure
 from openai import OpenAI
 from policies.obstacles import ObstacleCatalog, ObstaclePlacement
+
+
+class ModelOutputError(ValueError):
+    """服务已返回响应，但正文不是规划器要求的 JSON。"""
+
+
 class LLMAdversarialPlanner:
     """基于大模型的对抗性策略规划器"""
     ATTACK_MODES = {"trajectory_only", "obstacle_only", "joint"}
@@ -48,17 +56,17 @@ class LLMAdversarialPlanner:
         # "qwen3.5-plus",
         # "qwen3.5-ocr",
         "qwen3.5-ocr",
-        "qwen3.5-plus",
-        "qwen3.7-max",
-        "qwen-plus",
+        # "qwen3.5-plus",  # 百炼免费额度已耗尽，自动停用
+        # "qwen3.7-max",  # 百炼免费额度已耗尽，自动停用
+        # "qwen-plus",  # 百炼免费额度已耗尽，自动停用
         "qwen-plus-0112",
         "qwen3-8b",
         "qwen-vl-ocr-1028",
-        "qwen3.5-flash-2026-02-23",
+        # "qwen3.5-flash-2026-02-23",  # 百炼免费额度已耗尽，自动停用
         "qwen3-max-preview",
-        "deepseek-v4-flash-0731",
+        # "deepseek-v4-flash-0731",  # 百炼免费额度已耗尽，自动停用
         "qwen3-vl-8b-thinking",
-        "qwen3-coder-plus",
+        # "qwen3-coder-plus",  # 百炼免费额度已耗尽，自动停用
         "qwen3-coder-480b-a35b-instruct",
         "glm-4.5-air",
         "qwen-long",
@@ -66,12 +74,21 @@ class LLMAdversarialPlanner:
         "deepseek-r1-distill-qwen-32b",
         "qwen3-vl-30b-a3b-thinking",
         "qwen-mt-flash",
+        "qwen-mt-lite",
         "qwen-max",
         "glm-5",
         "deepseek-r1-distill-qwen-7b",
         "qwen-plus-2025-07-28",
         "qwen3-vl-32b-thinking",
         "qwen3-vl-235b-a22b-thinking",
+        "qwen-math-turbo",
+        # "qwen3.7-plus",  # 百炼免费额度已耗尽，自动停用
+        "qwen3.6-plus",
+        "qwen-vl-ocr-latest",
+        "qwen3.8-max-0902",
+        "qwen3.8-omni-flash",
+        "qwen3.8-omni-flash-realtime",
+        "qwen3.5-omni-plus-2026-03-15",
         # "",
     )
 
@@ -82,13 +99,28 @@ class LLMAdversarialPlanner:
             LLM的输入输出全部基于局部坐标系,局部坐标系的原点为自车位置,y轴正方向为自车朝向。
             LLM类方法的输入输出全部基于全局坐标系,全局坐标系的原点为地图原点,y轴正方向为地图北方。因此需要在调用LLM前将环境状态归一化到局部坐标系,并在获取LLM输出后将其转换回全局坐标系。
         """
-        # 显式候选池用于生产配置；直接构造时则允许将指定模型置于首位，便于测试。
+        requested_provider = str(provider or os.getenv("LLM_PROVIDER", "dashscope")).lower()
+        normalized_provider = self.PROVIDER_ALIASES.get(requested_provider)
+        # 百炼默认池以源码中的活动条目为准；被注释的耗尽模型不能被旧默认名重新加入。
         if model_names is None:
-            requested_models = [model_name, *self.FREE_MODEL_POOL]
+            if normalized_provider == "dashscope":
+                requested_models = list(self.FREE_MODEL_POOL)
+                if model_name in self.FREE_MODEL_POOL:
+                    requested_models.insert(0, model_name)
+            else:
+                requested_models = [model_name]
         else:
             requested_models = list(model_names)
             if model_name and model_name not in requested_models:
                 requested_models.insert(0, model_name)
+        if normalized_provider == "dashscope":
+            # 启动器可能仍携带旧显式池；跨进程读取源码中的永久停用标记，禁止再次消耗请求。
+            exhausted = self._exhausted_models_from_source()
+            requested_models = [
+                name for name in requested_models if str(name) not in exhausted
+            ]
+            if not requested_models:
+                requested_models = list(self.FREE_MODEL_POOL)
         self.model_names = tuple(dict.fromkeys(str(name) for name in requested_models if name))
         if not self.model_names:
             raise ValueError("大模型候选列表不能为空")
@@ -107,8 +139,7 @@ class LLMAdversarialPlanner:
         self.use_obstacles = self.attack_mode in {"obstacle_only", "joint"}
         self.obstacle_catalog = ObstacleCatalog()
         # 提供方仅控制鉴权变量、端点和 API 契约；模型候选池仍由调用方显式配置。
-        requested_provider = str(provider or os.getenv("LLM_PROVIDER", "dashscope")).lower()
-        self.provider = self.PROVIDER_ALIASES.get(requested_provider)
+        self.provider = normalized_provider
         if self.provider is None:
             supported = ", ".join(sorted(self.PROVIDER_DEFAULTS))
             raise ValueError(f"不支持的 LLM 提供方：{requested_provider}，可选值为：{supported}")
@@ -706,7 +737,7 @@ Current scene state:
             try:
                 return "", self._parse_json_object(raw)
             except (TypeError, json.JSONDecodeError) as error:
-                raise ValueError(f"无法将 OpenAI Responses 输出解析为 JSON：{raw}") from error
+                raise ModelOutputError("OpenAI Responses 输出不是有效 JSON") from error
 
         if self.use_multimodal:
             if scene_image is None:
@@ -731,7 +762,7 @@ Current scene state:
             try:
                 return reasoning, self._parse_json_object(raw)
             except (TypeError, json.JSONDecodeError) as e:
-                raise ValueError(f"无法将多模态大模型输出解析为 JSON：{raw}") from e
+                raise ModelOutputError("多模态大模型输出不是有效 JSON") from e
 
         # 部分 OpenAI 兼容服务只接受 Chat Completions；纯文本与多模态共用该契约。
         request_kwargs = {
@@ -741,37 +772,84 @@ Current scene state:
         # 百炼和 ModelScope 的 Qwen 兼容接口支持关闭思考，以稳定输出 JSON 计划。
         if self.provider in {"dashscope", "qwen"}:
             request_kwargs["extra_body"] = {"enable_thinking": False}
+        if self.provider == "dashscope":
+            # 百炼官方 JSON Object 模式保证响应为标准 JSON；字段和物理语义仍由本地验证器复核。
+            request_kwargs["response_format"] = {"type": "json_object"}
         response = self.client.chat.completions.create(**request_kwargs)
         message = response.choices[0].message
         reasoning = getattr(message, "reasoning_content", "") or ""
         try:
             return reasoning, self._parse_json_object(message.content)
         except (TypeError, json.JSONDecodeError) as error:
-            raise ValueError(f"无法将纯文本大模型输出解析为 JSON：{message.content}") from error
+            raise ModelOutputError("纯文本大模型输出不是有效 JSON") from error
 
     def _request_attack_plan(self, prompt, scene_image=None):
         """按候选池轮换模型，服务、额度或模型可用性失败时自动切换。"""
         last_service_error = None
-        candidate_count = len(self.model_names)
-        for offset in range(candidate_count):
-            model_index = (self._preferred_model_index + offset) % candidate_count
-            model_name = self.model_names[model_index]
+        last_output_error = None
+        # 仅记录公开模型名和错误类别，不能把提示、响应正文或凭据写入审计。
+        self.last_attempted_model_names = []
+        self.last_model_failures = []
+        # 使用本轮快照，避免永久移除额度耗尽模型时破坏遍历下标。
+        candidate_models = self.model_names
+        candidate_count = len(candidate_models)
+        start_index = min(self._preferred_model_index, max(candidate_count - 1, 0))
+        ordered_models = candidate_models[start_index:] + candidate_models[:start_index]
+        for model_name in ordered_models:
+            # 只记录公开模型名称，供正式实验审计回退与模型分布。
+            self.last_attempted_model_name = model_name
+            self.last_attempted_model_names.append(model_name)
             try:
                 result = self._request_attack_plan_once(model_name, prompt, scene_image)
+            except ModelOutputError as error:
+                # HTTP 成功但输出不可解析属于模型输出质量问题；轮换模型，但不触发服务熔断。
+                last_output_error = error
+                self.last_model_failures.append({
+                    "model": model_name,
+                    "category": "invalid_json_output",
+                    "status_code": None,
+                })
+                print(
+                    f"[大模型规划器] 模型 {model_name} 返回的内容不是有效 JSON，"
+                    "正在切换候选模型。"
+                )
+                continue
             except Exception as error:
                 if not self._is_service_failure(error):
                     raise
                 last_service_error = error
                 status_code = getattr(error, "status_code", None)
+                self.last_model_failures.append({
+                    "model": model_name,
+                    "category": "service_failure",
+                    "status_code": status_code,
+                    "free_quota_exhausted": bool(
+                        self.provider == "dashscope"
+                        and self._is_free_quota_exhausted(error)
+                    ),
+                })
                 status_text = "未知状态" if status_code is None else str(status_code)
-                print(
-                    f"[大模型规划器] 模型 {model_name} 暂不可用"
-                    f"(状态 {status_text})，正在切换候选模型。"
-                )
+                if self.provider == "dashscope" and self._is_free_quota_exhausted(error):
+                    self._disable_exhausted_model(model_name)
+                    print(
+                        f"[大模型规划器] 模型 {model_name} 的百炼免费额度已耗尽"
+                        f"(状态 {status_text})，已永久停用并切换候选模型。"
+                    )
+                else:
+                    print(
+                        f"[大模型规划器] 模型 {model_name} 暂不可用"
+                        f"(状态 {status_text})，正在切换候选模型。"
+                    )
                 continue
-            self._preferred_model_index = model_index
+            # 候选池可能已在本轮缩短，因此按当前池重新确定首选下标。
+            if model_name in self.model_names:
+                self._preferred_model_index = self.model_names.index(model_name)
             self.model_name = model_name
+            self.last_successful_model_name = model_name
             return result
+        if last_output_error is not None:
+            # 至少一个模型成功返回了 HTTP 响应，因此整轮不能记作规划服务失败。
+            raise last_output_error
         if last_service_error is not None:
             raise last_service_error
         raise RuntimeError("没有可用的大模型候选项")
@@ -783,6 +861,105 @@ Current scene state:
         self._preferred_model_index = (self._preferred_model_index + 1) % len(self.model_names)
         self.model_name = self.model_names[self._preferred_model_index]
         print(f"[大模型规划器] 下次规划将改用候选模型 {self.model_name}。")
+
+    @staticmethod
+    def _error_text(error):
+        """汇总 SDK 异常中的公开错误码和正文，不记录请求或凭据。"""
+        parts = [str(error)]
+        for attribute in ("code", "body", "message"):
+            value = getattr(error, attribute, None)
+            if value is not None:
+                parts.append(str(value))
+        response = getattr(error, "response", None)
+        if response is not None:
+            parts.append(str(getattr(response, "text", "")))
+        return " ".join(parts).lower()
+
+    @classmethod
+    def _is_free_quota_exhausted(cls, error):
+        """仅识别百炼明确报告的免费额度耗尽，普通 429 限流不永久停用。"""
+        message = cls._error_text(error)
+        return any(token in message for token in (
+            "allocationquota.freetieronly",
+            "free quota expired or exhausted",
+            "free allocated quota exceeded",
+            "free quota has been exhausted",
+            "free tier quota has been exhausted",
+        ))
+
+    @staticmethod
+    def _exhausted_models_from_source(source_path=None):
+        """读取带永久停用标记的注释项，使新进程不再尝试已耗尽模型。"""
+        path = Path(source_path or __file__).resolve()
+        try:
+            source = path.read_text(encoding="utf-8")
+        except OSError:
+            return set()
+        pattern = re.compile(
+            r'^\s*#\s*["\'](?P<name>[^"\']+)["\']\s*,'
+            r'.*百炼免费额度已耗尽',
+            re.MULTILINE,
+        )
+        return {match.group("name") for match in pattern.finditer(source)}
+
+    def _disable_exhausted_model(self, model_name):
+        """从当前进程候选池移除模型，并在源码候选表中注释该模型。"""
+        self.model_names = tuple(name for name in self.model_names if name != model_name)
+        self._preferred_model_index = 0
+        if self.model_names:
+            self.model_name = self.model_names[0]
+        try:
+            changed = self._comment_out_exhausted_model(model_name)
+        except OSError as error:
+            # 源码只读不应阻止本轮自动回退；当前进程仍保持停用状态。
+            print(f"[大模型规划器] 无法写回模型候选表：{type(error).__name__}")
+            return
+        if not changed:
+            print(f"[大模型规划器] 候选表中未找到活动模型 {model_name}，未修改源码。")
+
+    @staticmethod
+    def _comment_out_exhausted_model(model_name, source_path=None):
+        """原子地注释 FREE_MODEL_POOL 中精确匹配的活动模型条目。"""
+        path = Path(source_path or __file__).resolve()
+        original = path.read_text(encoding="utf-8")
+        lines = original.splitlines(keepends=True)
+        in_pool = False
+        changed = False
+        escaped_name = re.escape(model_name)
+        active_pattern = re.compile(
+            rf'^(?P<indent>[ \t]*)["\']{escaped_name}["\'][ \t]*,[ \t]*'
+            rf'(?P<comment>#[^\r\n]*)?(?P<ending>\r?\n)?$'
+        )
+        for index, line in enumerate(lines):
+            if not in_pool and re.match(r"^\s*FREE_MODEL_POOL\s*=\s*\(", line):
+                in_pool = True
+                continue
+            if in_pool and re.match(r"^\s*\)\s*$", line.rstrip("\r\n")):
+                break
+            if not in_pool:
+                continue
+            match = active_pattern.match(line)
+            if match is None:
+                continue
+            ending = match.group("ending") or ""
+            lines[index] = (
+                f'{match.group("indent")}# "{model_name}",  '
+                f'# 百炼免费额度已耗尽，自动停用{ending}'
+            )
+            changed = True
+            break
+        if not changed:
+            return False
+
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        try:
+            temporary.write_text("".join(lines), encoding="utf-8")
+            os.chmod(temporary, path.stat().st_mode)
+            os.replace(temporary, path)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+        return True
 
     @staticmethod
     def _validate_attack_plan(attack_plan, normalized_env_state):
@@ -900,6 +1077,13 @@ Current scene state:
             return None
 
         self.last_request_failed = False
+        self.last_trace = {
+            "provider": self.provider,
+            "attempted_model": None,
+            "attempted_models": [],
+            "successful_model": None,
+            "model_failures": [],
+        }
 
         # 将结构化环境状态序列化后再交给大模型。
         env_state_json = json.dumps(env_state, indent=2)
@@ -913,6 +1097,12 @@ Current scene state:
         )
         try:
             reasoning, attack_plan = self._request_attack_plan(prompt, scene_image)
+            self.last_trace.update(
+                attempted_model=getattr(self, "last_attempted_model_name", None),
+                attempted_models=list(getattr(self, "last_attempted_model_names", [])),
+                successful_model=getattr(self, "last_successful_model_name", None),
+                model_failures=list(getattr(self, "last_model_failures", [])),
+            )
             # print(f"推理过程: {reasoning[:200]}...")  # 仅打印开头
             # print(f"攻击计划: {attack_plan}")
 
@@ -968,6 +1158,12 @@ Current scene state:
             return attack_plan
 
         except Exception as e:
+            self.last_trace.update(
+                attempted_model=getattr(self, "last_attempted_model_name", None),
+                attempted_models=list(getattr(self, "last_attempted_model_names", [])),
+                successful_model=getattr(self, "last_successful_model_name", None),
+                model_failures=list(getattr(self, "last_model_failures", [])),
+            )
             self.last_error = str(e)
             self.last_request_failed = self._is_service_failure(e)
             if isinstance(e, ValueError) and not self.last_request_failed:
@@ -1012,6 +1208,8 @@ Current scene state:
     @staticmethod
     def _is_service_failure(error):
         """判断异常是否表示 LLM 服务暂不可用，而非模型计划本身不合规。"""
+        if isinstance(error, TimeoutError):
+            return True
         status_code = getattr(error, "status_code", None)
         if status_code in {401, 403, 404, 408, 429} or (isinstance(status_code, int) and status_code >= 500):
             return True

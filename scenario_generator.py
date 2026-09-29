@@ -45,6 +45,14 @@ class AdversarialScenarioGenerator:
         self.attack_frequency = int(getattr(llm_cfg, 'planning_interval_frames', 3))
         if self.min_planning_step < 0 or self.attack_frequency < 1:
             raise ValueError('最早规划帧必须非负，查询间隔必须至少一帧')
+        # 画像候选干跑仅构建并记录规则候选，不调用 LLM，也不注入攻击。
+        # 默认关闭，专门用于正式实验前无偏筛选有交互条件的场景。
+        self.profile_candidate_dry_run = bool(getattr(llm_cfg, 'profile_candidate_dry_run', False))
+        # 默认关闭以保持旧排序协议；画像正式实验可接受 LLM 返回候选排序前缀，
+        # 未列出的候选仍按规则层安全排序补齐，后续连续轨迹门控完全不变。
+        self.llm_planner.profile_allow_partial_ranking = bool(
+            getattr(llm_cfg, 'profile_allow_partial_ranking', False)
+        )
         self.last_attack_frame = 0      # 上一次攻击的时间
         self.last_query_frame = 0       # 上一次查询攻击的时间
         self.history_frames = 20        # 历史帧数
@@ -81,6 +89,8 @@ class AdversarialScenarioGenerator:
         self.risk_metrics = AdversarialRiskMetrics(evaluation_cfg)
         self.difficulty_mode, self.target_difficulty, self.difficulty_tolerance = self._read_difficulty_control()
         self.profile_enabled, self.escalation_enabled, self.full_method_enabled = self._read_iterative_switches()
+        if self.profile_candidate_dry_run and not self.profile_enabled:
+            raise ValueError('画像候选干跑要求 profile_enabled=true')
         # 兼容无配置的最小测试及关闭攻击的入口。
         difficulty_cfg = getattr(evaluation_cfg, "difficulty_control", None)
         controller_config = dict(getattr(difficulty_cfg, "controller", None) or {})
@@ -208,7 +218,15 @@ class AdversarialScenarioGenerator:
                 context['obstacle_candidates']=build_obstacle_candidates(env,self.llm_planner,context['candidates'],self.profile_pipeline.builder)
             if query_trace is not None:
                 query_trace.append({'kind':'profile_ranking_input','step':int(env.current_step),'context':context})
-            if getattr(self, "multiagent_planner", None) is None:
+            if getattr(self, 'profile_candidate_dry_run', False):
+                # 使用与正式画像实验完全相同的候选构建入口，但在模型边界前停止。
+                attack_plan = {
+                    'attack': False,
+                    'reason': 'profile_candidate_dry_run',
+                    'candidate_count': len(context['candidates']),
+                    'candidate_rejection_count': len(context.get('candidate_rejections', [])),
+                }
+            elif getattr(self, "multiagent_planner", None) is None:
                 attack_plan = rank_profile_candidates(self.llm_planner,env_state,selected_instruction,context,scene_image)
             else:
                 # 画像身份和场景条件仅扩展协作输入，不改变原单 Agent 提示。
@@ -236,6 +254,8 @@ class AdversarialScenarioGenerator:
         if query_trace is not None:
             query_trace.append({'kind': 'llm_output', 'step': int(env.current_step),
                                 'instruction': selected_instruction, 'validated_plan': attack_plan,
+                                'planner_skipped_reason': ('profile_candidate_dry_run'
+                                    if getattr(self, 'profile_candidate_dry_run', False) else None),
                                 'request_failed': bool(getattr(self.llm_planner, 'last_request_failed', False)),
                                 'planner_trace': getattr(self.llm_planner, 'last_trace', None),
                                 'planner_wall_seconds': planner_wall_seconds})
@@ -678,12 +698,10 @@ class AdversarialScenarioGenerator:
             return "qwen3-32b"
 
     def _read_llm_model_names(self):
-        """读取固定候选池，避免在不同提供方之间隐式切换模型。"""
+        """读取显式候选池；为空时由当前提供方的规划器选择默认池。"""
         environment_models = os.getenv("LLM_MODEL_NAMES")
         if environment_models:
             return [name.strip() for name in environment_models.split(",") if name.strip()]
-        if os.getenv("LLM_MODEL_NAME"):
-            return [os.environ["LLM_MODEL_NAME"]]
         try:
             return list(self.cfg.sim.llm.model_names)
         except (AttributeError, TypeError):

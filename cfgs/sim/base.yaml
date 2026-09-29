@@ -14,6 +14,13 @@ ego_profile:
   lane_half_width_m: 1.8 # 无道路边界时的保守中心线走廊近似
   ttc_range_s: [1.0, 5.0] # 追求可规避但反应余量小的交互
   low_speed_decelerations_mps2: [] # 默认关闭；实验可显式添加低速减速锚点，仍接受完整候选安全筛查
+  # 默认关闭的目录覆盖率扩展；仅扩大进入既有安全筛选的候选，不改变画像关闭流程。
+  candidate_expansion_enabled: false
+  candidate_expansion_longitudinal_range_m: [2.0, 60.0]
+  candidate_expansion_lateral_limit_m: 10.0
+  candidate_expansion_heading_limit_rad: 1.2
+  # 后向逼近只在实验显式给出加速度时启用；仍要通过交互、背景 OBB 与联合轨迹安全门控。
+  rear_approach_accelerations_mps2: []
 rl_model_path: ${project_root}/metadata/gpudrive_checkpoint # path to the RL model
 rl_model_name: pretrained # name of the RL model
 polyline_reduction_threshold: 0.1 # from gpudrive
@@ -24,6 +31,15 @@ visualization:
   show_llm_anchors: True # 是否绘制 LLM 生成的稀疏轨迹锚点
   show_diffusion_trajectory: True # 是否绘制 Safe-Sim 生成的攻击者未来细化轨迹
   show_diffusion_candidates: False # 是否绘制攻击目标的全部扩散候选路线（半透明）
+# 默认关闭的论文真实性审计；开启后按 SAFE-SIM 口径比较模拟轨迹与同场景真实轨迹。
+realism_audit:
+  enabled: false
+  reference_histogram_path: null # SAFE-SIM 格式的真实数据直方图；正式审计必须冻结该文件。
+  minimum_samples: 8
+  velocity_bins: [0.0, 1.5, 3.0, 4.5, 6.0, 7.5, 9.0, 10.5, 12.0, 13.5, 15.0, 16.5, 18.0, 19.5, 21.0, 22.5, 24.0, 25.5, 27.0, 28.5, 30.0]
+  lon_accel_bins: [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0, 6.5, 7.0, 7.5, 8.0, 8.5, 9.0, 9.5, 10.0]
+  lat_accel_bins: [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0, 6.5, 7.0, 7.5, 8.0, 8.5, 9.0, 9.5, 10.0]
+  jerk_bins: [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0, 20.0]
 verbose: True # report metrics after each simulation?
 steps: 400 # number of steps in each simulation
 dt: 0.1 # time delta between simulation steps
@@ -144,18 +160,22 @@ traffic_model:
     max_update: 0.5 # 单次引导对控制量的最大修正幅度
     guide_steps: 1 # 每个反向扩散步执行的引导更新次数
     scale_grad_by_std: True # 按当前扩散噪声方差缩放梯度
+    anchor_drive_enabled: False # AnchorDrive 风格时空锚点与安全优先候选重排；消融验证后再用于正式实验
+    phase_weights: [0.75, 1.25, 1.75] # 接近、交互、收束三阶段的锚点权重
+    candidate_score_weight: 0.25 # 仅在硬安全门槛通过的候选间按锚点误差重排
 llm:
   # 四组消融只切换此参数；single 完整沿用当前调用流程。
   multiagent:
     mode: single # single / conditional_critic / parallel_arbiter / parallel_memory
     timeout_seconds: 60
     memory_path: null # 仅 parallel_memory 读取冻结的离线复盘知识库
-  # 默认百炼文本模型；实验中固定单模型，不自动轮换以免混入模型差异。
+  # 百炼按规划器中的活动候选池自动回退；正式对照可显式固定单模型。
   provider: dashscope
-  model_name: qwen3.5-plus
-  model_names:
-    - qwen3.5-plus
+  model_name: qwen-plus
+  model_names: null
   max_planning_calls: 30 # 实验按组固定调用预算，不随画像开关变化
+  profile_candidate_dry_run: false # 仅画像候选预筛：记录候选与拒绝原因，不调用 LLM、不注入攻击
+  profile_allow_partial_ranking: false # 画像候选排序可选：接受非空合法前缀并按规则顺序补齐
   multimodal: False # False 为纯文本模式；True 为当前帧图像加结构化场景数据
   attack_mode: trajectory_only # trajectory_only、obstacle_only、joint；决定每次查询允许的攻击类型
   max_consecutive_failures: 3 # 连续服务/API失败达到该次数后，本场景不再调用 LLM
