@@ -1,7 +1,7 @@
 """百炼联合模式的候选边界与实际规划协议回归；传输层使用替身。"""
 import json
 
-from policies.llm_adversarial_planner import LLMAdversarialPlanner
+from policies.llm_adversarial_planner import LLMAdversarialPlanner, ModelOutputError
 from policies.obstacles import ObstacleCatalog
 from policies.profile_obstacles import build_obstacle_candidates, chosen_obstacle
 from policies.profile_planner import rank_profile_candidates
@@ -23,12 +23,13 @@ def context_for_obstacles(env,planner):
     return context
 
 
-def test_joint_obstacle_candidate_with_no_dynamic_attacker():
+def test_joint_obstacle_only_selection_with_available_dynamic_candidate():
     env=environment()
     env.data_dict['agent'][-1][0,1]=6.
     planner=obstacle_planner()
     context=context_for_obstacles(env,planner)
-    assert not context['candidates']
+    # TTC 区间门控暂时关闭后，区间外动态候选会保留；联合协议仍允许只选障碍物。
+    assert context['candidates']
     assert context['obstacle_candidates']
     candidate=context['obstacle_candidates'][0]
     assert candidate['placement']['type']=='cone_line'
@@ -36,7 +37,7 @@ def test_joint_obstacle_candidate_with_no_dynamic_attacker():
 
     def response(prompt,scene_image=None):
         payload=json.loads(prompt.split('\n',1)[1])
-        return '',dict(request_id=payload['request_id'],ranking=[],no_attack_reason='no dynamic target',
+        return '',dict(request_id=payload['request_id'],ranking=[],no_attack_reason='select obstacle-only probe',
                        obstacle_candidate_id=candidate['obstacle_candidate_id'])
     planner._request_attack_plan=response
     plan=rank_profile_candidates(planner,env.get_state_for_planning(),[],context)
@@ -82,3 +83,28 @@ def test_trajectory_mode_retains_existing_three_field_ranking():
     result=rank_profile_candidates(planner,env.get_state_for_planning(),[],context)
     assert result['attack']
     assert 'obstacle_plan' not in result
+
+
+def test_invalid_json_ranking_is_validation_failure_not_service_failure():
+    env=environment()
+    planner=fixture_planner()
+    planner.provider='dashscope'
+    planner.use_obstacles=False
+    planner._is_service_failure=LLMAdversarialPlanner._is_service_failure
+    planner.last_attempted_model_names=['bad-json']
+    planner.last_model_failures=[{
+        'model':'bad-json','category':'invalid_json_output','status_code':None,
+    }]
+    planner.last_successful_model_name=None
+
+    def invalid_response(prompt,scene_image=None):
+        raise ModelOutputError('纯文本大模型输出不是有效 JSON')
+
+    planner._request_attack_plan=invalid_response
+    context=pipeline().context(env,.5)
+    assert rank_profile_candidates(
+        planner,env.get_state_for_planning(),[],context
+    ) is None
+    assert not planner.last_request_failed
+    assert planner.last_trace['plan_validation']=='plan_validation_failed'
+    assert planner.last_trace['attempted_models']==['bad-json']

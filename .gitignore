@@ -56,3 +56,23 @@ run.sh
 /logs/
 /nl_guidance_eval/
 /work/
+
+# 可复用E1比较代码；仅放行明确源码，实验结果仍保持忽略。
+!/experiments/
+/experiments/*
+!/experiments/comparison/
+/experiments/comparison/*
+!/experiments/comparison/__init__.py
+!/experiments/comparison/methods.py
+!/experiments/comparison/run_method_comparison.py
+!/experiments/comparison/formal_metrics.py
+!/experiments/comparison/run_passive_baseline.py
+!/experiments/comparison/strive_official_worker.py
+!/experiments/comparison/run_strive_baseline.py
+!/experiments/comparison/probe_strive_official.py
+!/experiments/comparison/probe_strive_counterfactual.py
+
+!/experiments/comparison/ctrl_sim_forecast.py
+!/experiments/comparison/probe_ctrl_sim_forecast.py
+!/experiments/comparison/run_e1_smoke.py
+!/experiments/comparison/probe_e1_recovery.py

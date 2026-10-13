@@ -122,6 +122,19 @@ def test_adjacent_lane_produces_cut_in_candidate():
     assert any(c['attack_family']=='cut_in' for c in candidates)
 
 
+def test_candidate_audit_explains_empty_catalog_and_rear_template_is_opt_in():
+    """目录扩展只在显式配置时添加后向逼近候选，默认协议不变。"""
+    env=environment()
+    env.data_dict['agent'][-1][0,:4]=[-12.,0.,8.,0.]
+    default=CandidateBuilder(NS())
+    candidates,rejected=default.build(env,{},NS(retrieve=lambda *args,**kwargs:{}))
+    assert not candidates and default.last_audit['ineligible']['longitudinal']==1
+    enabled=CandidateBuilder(NS(rear_approach_accelerations_mps2=[4.]))
+    candidates,rejected=enabled.build(env,{},NS(retrieve=lambda *args,**kwargs:{}))
+    assert any(c['strategy']=='sudden_acceleration' and c['attack_family']=='rear_pressure' for c in candidates)
+    assert enabled.last_audit['rear_eligible_agents']==1
+
+
 def test_candidate_rejects_background_overlap_and_static():
     env = environment()
     env.data_dict['agent'][-1] = np.repeat(env.data_dict['agent'][-1],2,axis=0)
@@ -165,6 +178,48 @@ def test_ranking_roundtrip_uses_only_catalog_and_existing_validator():
     assert p.last_trace['plan_validation']=='accepted'
 
 
+def test_nonempty_ranking_accepts_null_no_attack_reason():
+    env,pipe,p = environment(),pipeline(),planner()
+    context = pipe.context(env,.5)
+    good = p._request_attack_plan
+    def request(*args,**kwargs):
+        reasoning,response = good(*args,**kwargs)
+        response['no_attack_reason'] = None
+        return reasoning,response
+    p._request_attack_plan = request
+    result = rank_profile_candidates(p,env.get_state_for_planning(),[],context)
+    assert result['attack'] and result['candidate_id'] == context['candidates'][0]['candidate_id']
+
+
+def test_partial_ranking_is_parameter_controlled_and_completed_safely():
+    env,pipe,p = environment(),pipeline(),planner()
+    context = pipe.context(env,.5)
+    assert len(context['candidates']) >= 2
+    selected = context['candidates'][1]['candidate_id']
+    def request(prompt,scene_image=None):
+        payload = json.loads(prompt.split('\n',1)[1])
+        return '',dict(request_id=payload['request_id'],ranking=[selected],no_attack_reason='')
+    p._request_attack_plan = request
+    assert rank_profile_candidates(p,env.get_state_for_planning(),[],context) is None
+    assert p.last_trace['validation_reason'] == 'ranking_not_catalog_permutation'
+
+    p.profile_allow_partial_ranking = True
+    result = rank_profile_candidates(p,env.get_state_for_planning(),[],context)
+    assert result['attack'] and result['candidate_id'] == selected
+    assert p.last_trace['partial_ranking_completed'] is True
+    assert set(p.last_trace['candidate_ranking']) == {item['candidate_id'] for item in context['candidates']}
+
+
+def test_empty_ranking_still_requires_text_reason():
+    env,pipe,p = environment(),pipeline(),planner()
+    def request(*args,**kwargs):
+        return '',dict(request_id=json.loads(args[0].split('\n',1)[1])['request_id'],
+                       ranking=[],no_attack_reason=None)
+    p._request_attack_plan = request
+    assert rank_profile_candidates(p,env.get_state_for_planning(),[],pipe.context(env,.5)) is None
+    assert p.last_trace['validation_reason'] == 'ranking_type'
+
+
 @pytest.mark.parametrize('corruption',['id','duplicate','control','unknown','reason'])
 def test_bad_rankings_rejected_without_free_planning(corruption):
     env,pipe,p = environment(),pipeline(),planner()
@@ -180,6 +235,8 @@ def test_bad_rankings_rejected_without_free_planning(corruption):
     p._request_attack_plan=request
     assert rank_profile_candidates(p,env.get_state_for_planning(),[],pipe.context(env,.5)) is None
     assert not p.last_request_failed
+    assert p.last_trace['validation_reason']
+    assert p.last_trace['response_summary']['keys']
 
 
 def test_empty_candidates_skip_service_and_failure_is_distinct():
@@ -191,6 +248,7 @@ def test_empty_candidates_skip_service_and_failure_is_distinct():
     p._request_attack_plan=broken
     assert rank_profile_candidates(p,env.get_state_for_planning(),[],pipeline().context(env,.5)) is None
     assert p.last_request_failed
+    assert p.last_trace['service_status_code'] is None
 
 
 def test_codex_top_one_cannot_change_anchors():
@@ -292,6 +350,25 @@ def test_joint_gate_checks_dynamics_but_never_road_distance():
     pipe.validate_joint(env)
 
 
+def test_candidate_ttc_band_gate_is_temporarily_disabled():
+    env,pipe = environment(),pipeline()
+    state=np.asarray(env.data_dict['agent'][-1][0],float)
+    times=np.arange(4,dtype=float)
+    # 静止自车与匀速远离的攻击者没有可估 TTC；候选仍应进入后续 diffusion。
+    env.ego_state[2:4]=0
+    anchors=state[:2]+times[:,None]*state[2:4]
+    estimate,reason=pipe.builder.screen(env,0,anchors,[env.scenario_dict['route']])
+    assert reason is None and estimate['estimated_ttc_s'] is None
+    assert estimate['estimated_risk'] is None and not estimate['ttc_band_gate_enabled']
+    # 低于原 1 秒下界的交互同样只记录 TTC，不再以 outside_ttc_band 拒绝。
+    env.ego_state[2]=20
+    env.data_dict['agent'][-1][0,0]=7
+    state=np.asarray(env.data_dict['agent'][-1][0],float)
+    anchors=state[:2]+times[:,None]*state[2:4]
+    estimate,reason=pipe.builder.screen(env,0,anchors,[env.scenario_dict['route']])
+    assert reason is None and estimate['estimated_ttc_s'] < 1.
+
+
 def test_previously_attacked_vehicle_skips_dynamics_gate():
     env,pipe = environment(),pipeline()
     env.previously_attacked_agent_ids={0}
@@ -321,6 +398,24 @@ def test_generator_profile_on_uses_ranking_and_off_uses_legacy(tmp_path):
     assert len(calls)==1 and 'adversarial_context' not in calls[0]
 
 
+def test_profile_candidate_dry_run_records_candidates_without_calling_llm(tmp_path):
+    from test_generator_wiring_unit import fixture
+    env,p = environment(),planner()
+    generator=fixture()
+    generator.llm_planner=p
+    generator.difficulty_mode='off'
+    generator.profile_candidate_dry_run=True
+    generator.query_trace=[]
+    generator.profile_pipeline.begin_attempt(env,tmp_path)
+    generator.plan_and_inject(env)
+    contexts=[row for row in generator.query_trace if row['kind']=='profile_ranking_input']
+    outputs=[row for row in generator.query_trace if row['kind']=='llm_output']
+    assert p.calls==0 and len(contexts)==1 and contexts[0]['context']['candidates']
+    assert outputs[0]['planner_skipped_reason']=='profile_candidate_dry_run'
+    assert outputs[0]['validated_plan']['reason']=='profile_candidate_dry_run'
+    assert env.attack_intent is None and generator._episode_attack_plan_count==0
+
+
 @pytest.mark.parametrize('outcome',['executed','unsolvable','service_failure'])
 def test_real_attempt_loop_accounts_for_all_outcomes(tmp_path,outcome):
     """运行生产尝试循环、生成器及审计；只替换仿真动力学、风险计算和 LLM 传输。"""
@@ -330,6 +425,7 @@ def test_real_attempt_loop_accounts_for_all_outcomes(tmp_path,outcome):
     from policies.evaluation_trace import AttemptTrace
     from policies.difficulty_audit import json_safe
     from policies.route_progress import normalized_route_progress
+    from run_simulation import merge_episode_info
     env,p=environment(),planner()
     if outcome=='service_failure':
         def fail(*args,**kwargs):
@@ -379,7 +475,8 @@ def test_real_attempt_loop_accounts_for_all_outcomes(tmp_path,outcome):
     tree=ast.parse((Path(__file__).resolve().parents[1]/'run_simulation.py').read_text())
     node=next(n for n in ast.walk(tree) if isinstance(n,ast.FunctionDef) and n.name=='_run_scenario_attempt')
     scope=dict(Path=Path,AttemptTrace=AttemptTrace,time=time,np=np,json=json,json_safe=json_safe,
-               normalized_route_progress=normalized_route_progress,NoSafeJointCandidate=NoSafeJointCandidate)
+               normalized_route_progress=normalized_route_progress,NoSafeJointCandidate=NoSafeJointCandidate,
+               merge_episode_info=merge_episode_info)
     exec(compile(ast.fix_missing_locations(ast.Module(body=[node],type_ignores=[])),'real_attempt','exec'),scope)
     evaluator=NS(env=env,generator=g,cfg=cfg,policy=NS(act=lambda obs:None),_metric_offsets=lambda:{},
                  _build_episode_result=lambda *args:dict(attack_plan_count=g._episode_attack_plan_count,obstacle_plan_count=0))

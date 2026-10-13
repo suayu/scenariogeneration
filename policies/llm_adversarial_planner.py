@@ -1,5 +1,6 @@
 # adversarial_modules.py
 import json
+from contextlib import contextmanager
 import os
 import base64
 import re
@@ -8,6 +9,30 @@ import numpy as np
 from policies.codex_planner_bridge import CodexQueueClient, PlannerServiceFailure
 from openai import OpenAI
 from policies.obstacles import ObstacleCatalog, ObstaclePlacement
+
+
+@contextmanager
+def _locked_model_pool(path):
+    """多 GPU 进程串行写回候选表，避免互相覆盖停用记录和用户列表。"""
+    lock_path = path.with_name('.' + path.name + '.lock')
+    with lock_path.open('a+b') as stream:
+        if os.name == 'nt':
+            import msvcrt
+            if stream.seek(0, 2) == 0:
+                stream.write(b'0'); stream.flush()
+            stream.seek(0)
+            msvcrt.locking(stream.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                stream.seek(0); msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
 class ModelOutputError(ValueError):
@@ -59,36 +84,49 @@ class LLMAdversarialPlanner:
         # "qwen3.5-plus",  # 百炼免费额度已耗尽，自动停用
         # "qwen3.7-max",  # 百炼免费额度已耗尽，自动停用
         # "qwen-plus",  # 百炼免费额度已耗尽，自动停用
-        "qwen-plus-0112",
-        "qwen3-8b",
+        # "qwen-plus-0112",
+        # "qwen3-8b",  # 百炼模型404，自动停用
         "qwen-vl-ocr-1028",
         # "qwen3.5-flash-2026-02-23",  # 百炼免费额度已耗尽，自动停用
-        "qwen3-max-preview",
+        # "qwen3-max-preview",  # 百炼模型404，自动停用
         # "deepseek-v4-flash-0731",  # 百炼免费额度已耗尽，自动停用
-        "qwen3-vl-8b-thinking",
+        # "qwen3-vl-8b-thinking",  # 百炼模型404，自动停用
         # "qwen3-coder-plus",  # 百炼免费额度已耗尽，自动停用
-        "qwen3-coder-480b-a35b-instruct",
-        "glm-4.5-air",
-        "qwen-long",
-        "qwen-vl-plus",
-        "deepseek-r1-distill-qwen-32b",
-        "qwen3-vl-30b-a3b-thinking",
+        # "qwen3-coder-480b-a35b-instruct",  # 百炼模型404，自动停用
+        # "glm-4.5-air",  # 百炼模型404，自动停用
+        # "qwen-long",  # 百炼免费额度已耗尽，自动停用
+        # "qwen-vl-plus",  # 百炼模型404，自动停用
+        # "deepseek-r1-distill-qwen-32b",  # 百炼模型404，自动停用
+        # "qwen3-vl-30b-a3b-thinking",  # 百炼模型404，自动停用
         "qwen-mt-flash",
         "qwen-mt-lite",
-        "qwen-max",
-        "glm-5",
-        "deepseek-r1-distill-qwen-7b",
-        "qwen-plus-2025-07-28",
-        "qwen3-vl-32b-thinking",
-        "qwen3-vl-235b-a22b-thinking",
+        # "qwen-max",  # 百炼免费额度已耗尽，自动停用
+        # "glm-5",  # 百炼免费额度已耗尽，自动停用
+        # "deepseek-r1-distill-qwen-7b",  # 百炼模型404，自动停用
+        # "qwen-plus-2025-07-28",  # 百炼模型404，自动停用
+        # "qwen3-vl-32b-thinking",  # 百炼模型404，自动停用
+        # "qwen3-vl-235b-a22b-thinking",  # 百炼模型404，自动停用
         "qwen-math-turbo",
         # "qwen3.7-plus",  # 百炼免费额度已耗尽，自动停用
-        "qwen3.6-plus",
+        # "qwen3.6-plus",  # 百炼免费额度已耗尽，自动停用
         "qwen-vl-ocr-latest",
         "qwen3.8-max-0902",
         "qwen3.8-omni-flash",
         "qwen3.8-omni-flash-realtime",
         "qwen3.5-omni-plus-2026-03-15",
+        "qwen3.8-27b",
+        "qwen3.8-flash",
+        "kimi-k3",
+        "qwen3.8-max-0902",
+        "deepseek-v4.1-flash",
+        "glm-5.3",
+        "deepseek-v4-pro-0813",
+        "qwen3.8-2.4t-a95b",
+        "qwen3.8-max",
+        "qwen3.7-flash",
+        "qwen-mt-uni",
+        "qwen3.8-omni-flash",
+        "qwen3.8-omni-flash-realtime",
         # "",
     )
 
@@ -120,7 +158,7 @@ class LLMAdversarialPlanner:
                 name for name in requested_models if str(name) not in exhausted
             ]
             if not requested_models:
-                requested_models = list(self.FREE_MODEL_POOL)
+                raise PlannerServiceFailure("全部指定百炼候选模型已永久停用")
         self.model_names = tuple(dict.fromkeys(str(name) for name in requested_models if name))
         if not self.model_names:
             raise ValueError("大模型候选列表不能为空")
@@ -170,6 +208,8 @@ class LLMAdversarialPlanner:
             self.client = OpenAI(
                 api_key=api_key,
                 base_url=self.base_url,
+                timeout=60.0,
+                max_retries=0,
             )
             self.available = True
         else:
@@ -791,11 +831,17 @@ Current scene state:
         self.last_attempted_model_names = []
         self.last_model_failures = []
         # 使用本轮快照，避免永久移除额度耗尽模型时破坏遍历下标。
+        if self.provider == "dashscope":
+            disabled = self._exhausted_models_from_source()
+            self.model_names = tuple(name for name in self.model_names if name not in disabled)
         candidate_models = self.model_names
         candidate_count = len(candidate_models)
         start_index = min(self._preferred_model_index, max(candidate_count - 1, 0))
         ordered_models = candidate_models[start_index:] + candidate_models[:start_index]
         for model_name in ordered_models:
+            # 其他 GPU 刚永久停用的模型不再发送请求。
+            if self.provider == "dashscope" and model_name in self._exhausted_models_from_source():
+                continue
             # 只记录公开模型名称，供正式实验审计回退与模型分布。
             self.last_attempted_model_name = model_name
             self.last_attempted_model_names.append(model_name)
@@ -835,6 +881,9 @@ Current scene state:
                         f"[大模型规划器] 模型 {model_name} 的百炼免费额度已耗尽"
                         f"(状态 {status_text})，已永久停用并切换候选模型。"
                     )
+                elif self.provider == "dashscope" and status_code == 404:
+                    self._disable_exhausted_model(model_name, reason="model_not_found")
+                    print(f"[大模型规划器] 模型 {model_name} 返回404，已永久停用并切换候选模型。")
                 else:
                     print(
                         f"[大模型规划器] 模型 {model_name} 暂不可用"
@@ -852,7 +901,7 @@ Current scene state:
             raise last_output_error
         if last_service_error is not None:
             raise last_service_error
-        raise RuntimeError("没有可用的大模型候选项")
+        raise PlannerServiceFailure("没有可用的大模型候选项")
 
     def _advance_after_invalid_plan(self):
         """当模型可调用但连续输出不合同计划时，下次查询改用后续候选模型。"""
@@ -897,19 +946,20 @@ Current scene state:
             return set()
         pattern = re.compile(
             r'^\s*#\s*["\'](?P<name>[^"\']+)["\']\s*,'
-            r'.*百炼免费额度已耗尽',
+            r'.*(?:百炼免费额度已耗尽|百炼模型404)',
             re.MULTILINE,
         )
         return {match.group("name") for match in pattern.finditer(source)}
 
-    def _disable_exhausted_model(self, model_name):
+    def _disable_exhausted_model(self, model_name, reason="free_quota_exhausted"):
         """从当前进程候选池移除模型，并在源码候选表中注释该模型。"""
         self.model_names = tuple(name for name in self.model_names if name != model_name)
         self._preferred_model_index = 0
         if self.model_names:
             self.model_name = self.model_names[0]
         try:
-            changed = self._comment_out_exhausted_model(model_name)
+            changed = (self._comment_out_exhausted_model(model_name) if reason == "free_quota_exhausted"
+                       else self._comment_out_exhausted_model(model_name, reason=reason))
         except OSError as error:
             # 源码只读不应阻止本轮自动回退；当前进程仍保持停用状态。
             print(f"[大模型规划器] 无法写回模型候选表：{type(error).__name__}")
@@ -918,48 +968,49 @@ Current scene state:
             print(f"[大模型规划器] 候选表中未找到活动模型 {model_name}，未修改源码。")
 
     @staticmethod
-    def _comment_out_exhausted_model(model_name, source_path=None):
+    def _comment_out_exhausted_model(model_name, source_path=None, reason="free_quota_exhausted"):
         """原子地注释 FREE_MODEL_POOL 中精确匹配的活动模型条目。"""
         path = Path(source_path or __file__).resolve()
-        original = path.read_text(encoding="utf-8")
-        lines = original.splitlines(keepends=True)
-        in_pool = False
-        changed = False
-        escaped_name = re.escape(model_name)
-        active_pattern = re.compile(
-            rf'^(?P<indent>[ \t]*)["\']{escaped_name}["\'][ \t]*,[ \t]*'
-            rf'(?P<comment>#[^\r\n]*)?(?P<ending>\r?\n)?$'
-        )
-        for index, line in enumerate(lines):
-            if not in_pool and re.match(r"^\s*FREE_MODEL_POOL\s*=\s*\(", line):
-                in_pool = True
-                continue
-            if in_pool and re.match(r"^\s*\)\s*$", line.rstrip("\r\n")):
-                break
-            if not in_pool:
-                continue
-            match = active_pattern.match(line)
-            if match is None:
-                continue
-            ending = match.group("ending") or ""
-            lines[index] = (
-                f'{match.group("indent")}# "{model_name}",  '
-                f'# 百炼免费额度已耗尽，自动停用{ending}'
+        with _locked_model_pool(path):
+            label = "百炼模型404" if reason == "model_not_found" else "百炼免费额度已耗尽"
+            original = path.read_text(encoding="utf-8")
+            lines = original.splitlines(keepends=True)
+            in_pool = False
+            changed = False
+            escaped_name = re.escape(model_name)
+            active_pattern = re.compile(
+                rf'^(?P<indent>[ \t]*)["\']{escaped_name}["\'][ \t]*,[ \t]*'
+                rf'(?P<comment>#[^\r\n]*)?(?P<ending>\r?\n)?$'
             )
-            changed = True
-            break
-        if not changed:
-            return False
+            for index, line in enumerate(lines):
+                if not in_pool and re.match(r"^\s*FREE_MODEL_POOL\s*=\s*\(", line):
+                    in_pool = True
+                    continue
+                if in_pool and re.match(r"^\s*\)\s*$", line.rstrip("\r\n")):
+                    break
+                if not in_pool:
+                    continue
+                match = active_pattern.match(line)
+                if match is None:
+                    continue
+                ending = match.group("ending") or ""
+                lines[index] = (
+                    f'{match.group("indent")}# "{model_name}",  '
+                    f'# {label}，自动停用{ending}'
+                )
+                changed = True
+            if not changed:
+                return False
 
-        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-        try:
-            temporary.write_text("".join(lines), encoding="utf-8")
-            os.chmod(temporary, path.stat().st_mode)
-            os.replace(temporary, path)
-        finally:
-            if temporary.exists():
-                temporary.unlink()
-        return True
+            temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+            try:
+                temporary.write_text("".join(lines), encoding="utf-8")
+                os.chmod(temporary, path.stat().st_mode)
+                os.replace(temporary, path)
+            finally:
+                if temporary.exists():
+                    temporary.unlink()
+            return True
 
     @staticmethod
     def _validate_attack_plan(attack_plan, normalized_env_state):
@@ -1208,7 +1259,7 @@ Current scene state:
     @staticmethod
     def _is_service_failure(error):
         """判断异常是否表示 LLM 服务暂不可用，而非模型计划本身不合规。"""
-        if isinstance(error, TimeoutError):
+        if isinstance(error, (TimeoutError, PlannerServiceFailure)):
             return True
         status_code = getattr(error, "status_code", None)
         if status_code in {401, 403, 404, 408, 429} or (isinstance(status_code, int) and status_code >= 500):
@@ -1221,7 +1272,7 @@ Current scene state:
                 "model not found",
                 "model_not_found",
                 "invalid model",
-                "does not exist",
+                "does not exist", "response_format", "enable_thinking", "json_object",
             )):
                 return True
         return type(error).__name__ in {

@@ -231,6 +231,11 @@ class DiffusionModelWrapper:
         set_global_batch_type("trajdata")
         register_llm_anchor_guidance()
         register_scenario_guidance()
+        # 显式 manual 配置可选择官方损失桥；旧 default/llm_joint 行为保持原样。
+        manual_functions = self.guidance_config.get("manual", {}).get("functions", [])
+        if self.guidance_mode == "manual" and any(str(name).startswith("safe_sim_") for name in manual_functions):
+            from policies.safe_sim_official_guidance import register_safe_sim_official_guidance
+            register_safe_sim_official_guidance()
         exp_config = get_experiment_config_from_file(str(self.config_path))
         exp_config.unlock()
         guidance = GuidanceConfig()
@@ -374,7 +379,7 @@ class DiffusionModelWrapper:
         # LLM 未攻击、锚点过期或目标不再活跃时，不得用最近车辆补造攻击目标。
         if self.guidance_mode == "llm_joint":
             return None
-        if "scenario_ttc" not in self.active_guidance_functions:
+        if not any(name in self.active_guidance_functions for name in ("scenario_ttc", "safe_sim_causecollision")):
             return None
         if frame.ego_state_global is None or len(safe_batch.row_to_agent_id) == 0:
             return None

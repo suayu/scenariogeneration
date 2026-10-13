@@ -17,12 +17,20 @@ from policies.safe_sim_adapter import SafeSimBatchAdapter
 from policies.traffic_types import JointTrajectory, ScenarioFrame
 from scenario_generator import AdversarialScenarioGenerator
 from policies.difficulty_control import DifficultyController
-from simulator import Simulator
+from simulator import Simulator, normalize_llm_model_names
 from utils.llm_scene_viz import render_llm_scene_png
 
 
 LLMAnchorLossCalculator = register_llm_anchor_guidance()
 ScenarioGuidanceCalculators = register_scenario_guidance()
+
+
+def test_null_llm_model_names_preserve_default_pool():
+    cfg = {'model_names': None}
+    assert normalize_llm_model_names(cfg, 'default-model') is None
+    assert normalize_llm_model_names(
+        {'model_names': ['a', 'b']}, 'default-model'
+    ) == ['a', 'b']
 
 
 def _frame(history_frames=4):
@@ -368,6 +376,50 @@ def test_wrapper_selects_one_shared_sample_from_joint_guidance_loss():
     torch.testing.assert_close(selected.positions, positions[:, 1])
 
 
+def test_anchor_drive_reranks_only_safe_joint_candidates_by_anchor_error():
+    class FakeLossCalculator:
+        def calculate_loss(self, action, state, guidance_data):
+            return state[..., 0].square()
+
+    class FakePolicyNet:
+        Loss_Calculater = FakeLossCalculator()
+
+        @staticmethod
+        def _prepare_guidance_data(model_batch):
+            return {"batch_size": 2, "world_from_agent": torch.eye(3).repeat(6, 1, 1),
+                    "ego_extents": torch.tensor([[4., 2.], [4., 2.]])}
+
+    wrapper = DiffusionModelWrapper.__new__(DiffusionModelWrapper)
+    wrapper.guidance_enabled = True
+    wrapper.anchor_drive_enabled = True
+    wrapper.anchor_candidate_score_weight = 10.0
+    positions = torch.zeros((2, 3, 1, 2))
+    positions[:, 1, 0, 0] = 1.0
+    positions[:, 2, 0, 0] = 2.0
+    positions[1, :, 0, 1] = 20.0
+    yaws = torch.zeros((2, 3, 1, 1))
+    action = SimpleNamespace(positions=torch.zeros((2, 1, 2)), yaws=torch.zeros((2, 1, 1)))
+    anchor_tensors = {
+        "llm_anchor_positions_local": torch.tensor([[[2.0, 0.0]], [[0.0, 0.0]]]),
+        "llm_anchor_mask": torch.tensor([[True], [False]]),
+        "llm_anchor_weights": torch.ones((2, 1)),
+    }
+
+    selected, selected_index = wrapper._select_joint_guided_action(
+        FakePolicyNet(), {}, action,
+        {"action_samples": {"positions": positions, "yaws": yaws}},
+        anchor_tensors,
+    )
+
+    assert selected_index == 2
+    assert wrapper._last_anchor_audit == {
+        "mean_error_m": 0.0,
+        "max_error_m": 0.0,
+        "candidate_score": 0.0,
+    }
+    torch.testing.assert_close(selected.positions, positions[:, 2])
+
+
 def test_llm_joint_without_attack_does_not_create_fallback_adversarial_target():
     frame = _frame()
     adapter = SafeSimBatchAdapter(
@@ -573,7 +625,10 @@ def test_adapter_interpolates_global_llm_anchors_for_target_only():
         "target_id": 0,
         "valid_steps": 5,
         "elapsed_seconds": 0.0,
+        "time_source": "fixed_interval",
+        "phase_weights": [1.0, 1.0, 1.0],
     }
+    np.testing.assert_allclose(tensors["llm_anchor_weights"][0], 1.0)
 
 
 def test_adapter_disables_expired_or_inactive_anchor_guidance():
@@ -626,6 +681,45 @@ def test_llm_anchor_loss_affects_only_target_and_scales_with_strength():
     loss.sum().backward()
     assert torch.all(state.grad[:2, :, 0] > 0)
     torch.testing.assert_close(state.grad[2:], torch.zeros_like(state.grad[2:]))
+
+
+def test_anchor_drive_phase_weights_emphasize_interaction_and_terminal_phases():
+    frame = _frame()
+    adapter = SafeSimBatchAdapter(history_frames=4, max_neighbors=2, raster_size=64, pixel_size=0.5)
+    batch = adapter.build(frame)
+    tensors, metadata = adapter.build_anchor_guidance(
+        frame=frame,
+        safe_batch=batch,
+        attack_intent={
+            "target_id": 0,
+            "anchors": [[10.0, 5.0], [11.0, 5.0], [12.0, 5.0], [13.0, 5.0]],
+            "anchor_times_s": [0.0, 0.4, 0.8, 1.2],
+            "source_step": frame.step,
+        },
+        prediction_horizon=12,
+        anchor_interval_seconds=1.0,
+        anchor_phase_weights=(0.5, 1.0, 2.0),
+    )
+
+    weights = tensors["llm_anchor_weights"][0].numpy()
+    assert metadata["time_source"] == "explicit"
+    assert weights[0] == 0.5
+    assert weights[5] == 1.0
+    assert weights[-1] == 2.0
+
+
+def test_llm_anchor_loss_applies_per_timestep_phase_weights():
+    state = torch.zeros((1, 3, 4), dtype=torch.float32)
+    state[:, :, 0] = 2.0
+    calculator = LLMAnchorLossCalculator(loss_scale=1.0, robust_delta=1.0)
+    calculator.set_anchor_targets(
+        torch.zeros((1, 3, 2)),
+        torch.ones((1, 3), dtype=torch.bool),
+        num_samples=1,
+        weights=torch.tensor([[0.5, 1.0, 2.0]]),
+    )
+    loss = calculator.calculate_loss(torch.zeros((1, 3, 2)), state, {"batch_size": 1})
+    torch.testing.assert_close(loss, torch.tensor([[0.75, 1.5, 3.0]]))
 
 
 def test_llm_anchor_direct_clean_action_gradient_reduces_position_error():
@@ -1163,3 +1257,25 @@ def test_qwen_provider_uses_modelscope_contract_and_disables_thinking():
     assert planner.provider == "qwen"
     assert planner.api_key_env == "MODELSCOPE_ACCESS_TOKEN"
     assert captured["extra_body"] == {"enable_thinking": False}
+
+
+def test_dashscope_provider_requests_json_object_and_disables_thinking():
+    """百炼纯文本规划必须使用官方结构化输出，避免 HTTP 200 后返回非 JSON。"""
+    raw_plan = {"attack": False, "attack_target_id": -1,
+                "strategy": "none", "anchors": [], "reason": "暂无合适目标"}
+    captured = {}
+
+    def create_completion(**kwargs):
+        captured.update(kwargs)
+        message = SimpleNamespace(content=json.dumps(raw_plan))
+        return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+    client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create_completion))
+    )
+    planner = LLMAdversarialPlanner(provider="dashscope", client=client)
+    _, plan = planner._request_attack_plan_once("qwen-plus-0112", "仅返回 JSON")
+
+    assert plan == raw_plan
+    assert captured["extra_body"] == {"enable_thinking": False}
+    assert captured["response_format"] == {"type": "json_object"}

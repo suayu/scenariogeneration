@@ -138,7 +138,8 @@ class Simulator:
                 tilt=self.cfg.sim.behaviour_model.tilt,
                 steps=self.steps,
             )
-        elif self.traffic_backend != 'log_replay':
+        # 外部基线通过强类型联合轨迹注入，不加载或更改既有扩散模型。
+        elif self.traffic_backend not in ('log_replay', 'external_joint'):
             raise ValueError(f"Unsupported traffic backend: {self.traffic_backend}")
 
         # 两个开销较大的控制器均随 Simulator 初始化一次，场景切换时只重置内部状态。

@@ -508,6 +508,7 @@ class AdversarialRiskMetrics:
         """清空当前场景统计，但不重建求解器。"""
         self._previous_headings = {}
         self._pending_baseline = None
+        self.last_ea_diagnostics = None
 
     def begin_attack(self, env):
         """在新的攻击轨迹或障碍物进入环境前冻结原始可达集。"""
@@ -559,18 +560,31 @@ class AdversarialRiskMetrics:
 
     def evaluate_ea(self, env):
         """计算当前帧自车与所有近场动态/静态对象的最大成对 EA。"""
+        self.last_ea_diagnostics = {"status": "disabled", "pair_count": 0}
         if not self.ea_enabled:
             return None
         dt = max(float(env.dt), 1e-6)
         ego = np.asarray(env.ego_state, dtype=np.float64)
+        self.last_ea_diagnostics = {"status": "valid", "pair_count": 0, "invalid_pair_count": 0,
+                                    "empty_object_policy": "zero_required_evasion_v2"}
+        def invalid_input(reason):
+            self.last_ea_diagnostics.update(status="invalid_input", reason=reason)
+            self.ea_undefined_frames += 1
+            return float("nan")
+        if ego.size < 7 or not np.isfinite(ego[:7]).all() or np.any(ego[5:7] <= 0):
+            return invalid_input("invalid_ego_state")
         ego_previous = self._previous_headings.get("ego", float(ego[4]))
         ego_yaw_rate = _wrap_angle(float(ego[4]) - ego_previous) / dt
         ego_user = self._road_user_from_array(ego, ego_yaw_rate)
         values = []
         agents = np.asarray(env.data_dict["agent"][-1], dtype=np.float64)
+        if agents.ndim != 2 or agents.shape[1] < 7 or len(env.agent_active) != len(agents):
+            return invalid_input("missing_or_misaligned_agent_state")
         for agent_id, state in enumerate(agents):
             if agent_id >= len(env.agent_active) or not env.agent_active[agent_id]:
                 continue
+            if not np.isfinite(state[:7]).all() or np.any(state[5:7] <= 0):
+                return invalid_input(f"invalid_active_agent:{agent_id}")
             if np.linalg.norm(state[:2] - ego[:2]) > 50.0:
                 continue
             key = f"agent:{agent_id}"
@@ -579,6 +593,9 @@ class AdversarialRiskMetrics:
             values.append(self.ea_solver.compute(ego_user, self._road_user_from_array(state, yaw_rate)))
             self._previous_headings[key] = float(state[4])
         for obstacle in env.get_static_obstacles():
+            geometry = np.asarray([*obstacle["center"], obstacle["yaw"], obstacle["length"], obstacle["width"]], dtype=float)
+            if not np.isfinite(geometry).all() or min(obstacle["length"], obstacle["width"]) <= 0:
+                return invalid_input("invalid_static_obstacle")
             if np.linalg.norm(np.asarray(obstacle["center"], dtype=float) - ego[:2]) > 50.0:
                 continue
             obstacle_user = RoadUserState(
@@ -592,11 +609,19 @@ class AdversarialRiskMetrics:
             )
             values.append(self.ea_solver.compute(ego_user, obstacle_user))
         self._previous_headings["ego"] = float(ego[4])
-        finite_values = [value for value in values if np.isfinite(value)]
-        if not finite_values:
-            self.ea_undefined_frames += 1
-            return float("nan")
-        frame_ea = float(max(finite_values))
+        self.last_ea_diagnostics["pair_count"] = len(values)
+        # 数据完整的空威胁集合无需规避，EA=0；它不同于输入缺失或求解失败。
+        if not values:
+            self.last_ea_diagnostics["status"] = "valid_empty_object_set"
+            frame_ea = 0.0
+        else:
+            invalid_count = sum(not np.isfinite(value) for value in values)
+            self.last_ea_diagnostics["invalid_pair_count"] = invalid_count
+            if invalid_count:
+                self.last_ea_diagnostics["status"] = "solver_undefined"
+                self.ea_undefined_frames += 1
+                return float("nan")
+            frame_ea = float(max(values))
         self.ea_values.append(frame_ea)
         return frame_ea
 
