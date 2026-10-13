@@ -240,6 +240,9 @@ evaluation:
     tolerance: 0.001
   reachability:
     enabled: True
+    backend: route_grid # 保留原实现；可显式切换commonroad独立进程后端
+    commonroad_python: /home2/zhaoyx/venvs/riskweaver-commonroad-reach-2025.2.1/bin/python
+    commonroad_timeout_seconds: 120
     horizon_seconds: 3.0 # 与 Safe-Sim 3.2 秒短时预测基本对齐
     timestep_seconds: 0.5
     longitudinal_resolution: 1.0

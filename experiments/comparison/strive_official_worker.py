@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import time
 
 
 def configure_rnn_autograd(model, backend):
@@ -35,6 +36,7 @@ def main():
     parser.add_argument('--init-iters', type=int, default=75)
     parser.add_argument('--adv-iters', type=int, default=300)
     parser.add_argument('--solution-iters', type=int, default=300)
+    parser.add_argument('--optimization-seconds', type=float, default=300)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--rnn-backend', choices=['native', 'cudnn'], default='native')
     args = parser.parse_args()
@@ -142,6 +144,13 @@ def main():
             protocol_stdout.write(json.dumps(result)+'\n'); protocol_stdout.flush()
             return
         embedding = detach_embed_info(embedding)
+        # 总优化预算跨初始化、对抗和解验证共享；官方网络与目标不变。
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+        from experiments.comparison.optimization_budget import OptimizationBudget
+        budget = OptimizationBudget(args.optimization_seconds)
+        for function, stage in [(run_init_optim, 'initialization'), (run_adv_gen_optim, 'adversarial'),
+                                (run_find_solution_optim, 'solution')]:
+            budget.install(function, stage)
         z = embedding['posterior_out'][0].clone()
         z,initial,_ = run_init_optim(z,graph.future_gt[...,:4],graph.future_vis,.1,weights,
                                  model,graph,map_env,map_idx,args.init_iters,embedding,embedding['prior_out'])
@@ -176,7 +185,7 @@ def main():
         attack_id = int(attack_ids[0])
         success = bool(compute_adv_gen_success(final,model,graph,attack_id))
         sol_ok = None
-        if success:
+        if success and not budget.expired:
             _,solution,_ = run_find_solution_optim(z,final,16,.05,weights,model,graph,map_env,map_idx,
                                       args.solution_iters,embedding,tgt_prior,other_prior)
             sol_ok = bool(compute_sol_success(solution[:,0:1],model,graph,map_env,map_idx))
@@ -184,6 +193,10 @@ def main():
         result = {'kind':'result','request_id':request_id,'status':'completed','model_loaded_strict':True,
                   'rnn_backend':args.rnn_backend,'official_commit':actual,'checkpoint_sha256':hashlib.sha256(args.checkpoint.read_bytes()).hexdigest(),
                   'model_dt':.5,'attack_row':attack_id,'attack_time_index':int(attack_times[0]),
+                  'optimization_budget_seconds':args.optimization_seconds,
+                  'optimization_truncated':bool(budget.truncated_stages or budget.expired),
+                  **budget.audit(),
+                  'solution_validation_status':'not_run_budget_exhausted' if success and sol_ok is None else 'evaluated' if sol_ok is not None else 'not_applicable',
                   'official_adv_success':success,'official_solution_success':sol_ok,
                   'future':normalizer.unnormalize(final[:,0]).cpu().numpy().tolist()}
         target = args.native_output if native else args.input

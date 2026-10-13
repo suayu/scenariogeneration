@@ -167,8 +167,12 @@ def counterfactual_rollout(env, policy, joint):
 
 class StriveController:
     """子进程隔离官方包，带请求ID、超时和真实自车策略的优化回调。"""
-    def __init__(self, root, python, checkpoint, directory, init_iters=75, adv_iters=300, timeout=1800):
+    def __init__(self, root, python, checkpoint, directory, init_iters=75, adv_iters=300, timeout=1800, optimization_seconds=300):
         self.root, self.python, self.checkpoint = Path(root), str(python), Path(checkpoint)
+        self.optimization_seconds = float(optimization_seconds)
+        self.optimization_spent = 0.0
+        if self.optimization_seconds <= 0:
+            raise ValueError("STRIVE scene optimization budget must be positive")
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=False)
         self.init_iters, self.adv_iters, self.timeout = int(init_iters), int(adv_iters), float(timeout)
@@ -180,7 +184,15 @@ class StriveController:
         if actual != OFFICIAL_COMMIT:
             raise ValueError("STRIVE official commit mismatch")
 
+    @property
+    def remaining_optimization_seconds(self):
+        """同一场景所有重规划共享预算，不把五分钟重新分配给每次调用。"""
+        return max(0.0, self.optimization_seconds-self.optimization_spent)
+
     def predict(self, env, policy):
+        if self.remaining_optimization_seconds <= 0:
+            from policies.joint_safety import NoSafeJointCandidate
+            raise NoSafeJointCandidate("strive_scene_optimization_budget_exhausted")
         frame = env.get_scenario_frame(history_frames=16)
         ego_history = np.zeros((16, 8), np.float32)
         ego_mask = np.zeros(16, bool)
@@ -195,7 +207,8 @@ class StriveController:
         worker = Path(__file__).resolve().parents[1] / 'experiments/comparison/strive_official_worker.py'
         cmd = [self.python, str(worker), '--root', str(self.root), '--checkpoint', str(self.checkpoint),
                '--input', str(folder), '--init-iters', str(self.init_iters), '--adv-iters', str(self.adv_iters),
-               '--solution-iters', str(self.adv_iters)]
+               '--solution-iters', str(self.adv_iters),
+               '--optimization-seconds', str(self.remaining_optimization_seconds)]
         started = time.monotonic()
         messages = queue.Queue()
         with (folder / 'worker.log').open('w', encoding='utf-8') as log:
@@ -244,7 +257,8 @@ class StriveController:
                         future = np.asarray(message['future'], np.float32)[1:]
                         future[..., :2] += np.asarray(request['origin'])
                         p,y,v = resample_trajectory(frame.states_global[frame.active_mask], future, .5, frame.dt)
-                        audit = {**metadata, **{k: val for k,val in message.items() if k != 'future'},
+                        self.optimization_spent += float(message.get('optimization_elapsed_seconds', 0.))
+                        audit = {**metadata, 'scene_optimization_spent_seconds':self.optimization_spent, **{k: val for k,val in message.items() if k != 'future'},
                                  'planner_rollout_calls': calls, 'elapsed_seconds': time.monotonic()-started,
                                  'fidelity': 'official_STRIVE_optimizer_adapted_Waymo_map_and_CV_initialization',
                                  'formal_ready': False}

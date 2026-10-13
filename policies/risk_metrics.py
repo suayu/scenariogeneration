@@ -429,6 +429,7 @@ class RouteReachability:
         )}
         controls = tuple(product(self.longitudinal_accelerations, self.lateral_accelerations))
         num_steps = int(round(self.horizon / self.dt))
+        area_curve = []
         for step_index in range(1, num_steps + 1):
             next_frontier = {}
             time_seconds = step_index * self.dt
@@ -473,7 +474,14 @@ class RouteReachability:
                     next_state = (next_s, next_d, next_v_s, next_v_d)
                     next_frontier.setdefault(quantize(next_state), next_state)
             frontier = next_frontier
+            positions = {(round(x[0] / self.s_resolution), round(x[1] / self.d_resolution))
+                         for x in frontier.values()}
+            area_curve.append({"time_seconds": time_seconds,
+                               "area_m2": float(len(positions) * self.s_resolution * self.d_resolution)})
             if not frontier:
+                # 一旦无可达状态，后续时刻继续记为零，不能丢弃失败时段。
+                area_curve.extend({"time_seconds": j * self.dt, "area_m2": 0.0}
+                                  for j in range(step_index + 1, num_steps + 1))
                 break
 
         terminal_positions = {
@@ -485,6 +493,10 @@ class RouteReachability:
             "area_m2": float(area),
             "solvable": bool(terminal_positions),
             "terminal_cell_count": int(len(terminal_positions)),
+            "area_curve": area_curve,
+            "minimum_area_m2": min((x["area_m2"] for x in area_curve), default=None),
+            "minimum_area_excludes_initial_state": True,
+            "backend": "route_grid",
             "horizon_seconds": self.horizon,
         }
 
@@ -498,7 +510,15 @@ class AdversarialRiskMetrics:
         self.ea_enabled = bool(_config_value(ea_config, "enabled", True))
         self.reachability_enabled = bool(_config_value(reach_config, "enabled", True))
         self.ea_solver = EvasiveAcceleration(ea_config)
-        self.reachability = RouteReachability(reach_config)
+        backend = _config_value(reach_config, "backend", "route_grid")
+        if backend == "route_grid":
+            self.reachability = RouteReachability(reach_config)
+        elif backend == "commonroad":
+            # 独立进程环境，不向主仿真环境安装CommonRoad依赖。
+            from policies.commonroad_reachability import CommonRoadReachability
+            self.reachability = CommonRoadReachability(reach_config)
+        else:
+            raise ValueError("unsupported reachability backend")
         self.ea_values = []
         self.ea_undefined_frames = 0
         self.reachability_events = []
@@ -539,7 +559,14 @@ class AdversarialRiskMetrics:
             "original_solvable": bool(self._pending_baseline["solvable"]),
             "dangerous_solvable": bool(dangerous["solvable"]),
             "difficulty": float(difficulty),
+            "original_area_curve": self._pending_baseline.get("area_curve", []),
+            "dangerous_area_curve": dangerous.get("area_curve", []),
+            "minimum_dangerous_area_m2": dangerous.get("minimum_area_m2"),
+            "reachability_backend": dangerous.get("backend", "route_grid"),
         }
+        from experiments.comparison.reaction_margin import curve_compression
+        event['response_space_compression'] = curve_compression(
+            event['original_area_curve'], event['dangerous_area_curve'])
         self.reachability_events.append(event)
         self._pending_baseline = None
         return event

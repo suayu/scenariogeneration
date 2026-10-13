@@ -44,6 +44,12 @@ class FormalRiskObserver:
     def finish_prediction(self, env, forecast=None, source="native", error=None):
         """联合预测存在时才计算干预后的可达性；缺失预测不以 CV 冒充。"""
         joint = getattr(env, "pending_joint_trajectory", None) if source == "native" else forecast
+        # 同一计划跨帧记录响应空间，不混入其它攻击窗口。
+        intent = getattr(env, "attack_intent", None)
+        self._attack = ({k: intent.get(k) for k in ("source_step", "target_id", "strategy")}
+                        if intent else None)
+        self._source_step = getattr(env, "current_step", None)
+        self._frame_dt = getattr(env, "dt", None)
         self._prediction_source = source
         self._prediction_error = error
         if source != "native" and joint is not None:
@@ -116,6 +122,9 @@ class FormalRiskObserver:
             "prediction_source": getattr(self, "_prediction_source", "native"),
             "prediction_error": getattr(self, "_prediction_error", None),
             "reachability": event,
+            "attack": getattr(self, "_attack", None),
+            "source_step": getattr(self, "_source_step", None),
+            "frame_dt": getattr(self, "_frame_dt", None),
             "metrics": metrics,
         }
         self.records.append(record)
